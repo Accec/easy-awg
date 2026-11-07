@@ -4,7 +4,7 @@ set +x
 set -Eeuo pipefail
 umask 077
 
-EASY_AWG_VERSION=v2026-11-08-3
+EASY_AWG_VERSION=v2026-11-08-4
 
 # Edit these defaults or supply environment variables when invoking the script.
 # The wizard shows each default and lets you replace it before installation.
@@ -4674,10 +4674,12 @@ def staged_file(directory, prefix, data, mode, owner):
 
 
 def confirm():
-    with open('/dev/tty', 'r+', encoding='utf-8') as terminal:
-        terminal.write('Type APPLY to replace only this script and retain a private backup: ')
-        terminal.flush()
-        return terminal.readline().strip() == 'APPLY'
+    # Buffered read/write mode requires seeking; terminals need separate streams.
+    with open('/dev/tty', 'r', encoding='utf-8') as reader, \
+            open('/dev/tty', 'w', encoding='utf-8') as writer:
+        writer.write('Type APPLY to replace only this script and retain a private backup: ')
+        writer.flush()
+        return reader.readline().strip() == 'APPLY'
 
 
 def install_candidate(invoked, original, candidate, tag):
@@ -4848,10 +4850,12 @@ def command_destination(destination, source):
 
 
 def command_confirm():
-    with open('/dev/tty', 'r+', encoding='utf-8') as terminal:
-        terminal.write('Type APPLY to install this command shortcut: ')
-        terminal.flush()
-        return terminal.readline().strip() == 'APPLY'
+    # Buffered read/write mode requires seeking; terminals need separate streams.
+    with open('/dev/tty', 'r', encoding='utf-8') as reader, \
+            open('/dev/tty', 'w', encoding='utf-8') as writer:
+        writer.write('Type APPLY to install this command shortcut: ')
+        writer.flush()
+        return reader.readline().strip() == 'APPLY'
 
 
 def command_path_collision(destination, source):

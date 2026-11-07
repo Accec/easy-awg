@@ -50,6 +50,8 @@ sudo bash ./setup-wireguard.sh --doctor awg-manage
 ```
 
 ## Script updates
+**One-time upgrade for versions v2026-11-08-2 and v2026-11-08-3:** these versions have a terminal-confirmation bug in shortcut installation and script updates (`File or stream is not seekable`). Version v2026-11-08-4 fixes both prompts. Download and verify the fixed release, then manually replace the saved script once; the affected updater fails at its own confirmation prompt. Keep the same canonical path if using an existing command symlink. Replacing only the script preserves AWG accounts, keys and network settings.
+
 Choose main-menu option **4**, or use:
 ```bash
 sudo bash ./setup-wireguard.sh --version
@@ -84,7 +86,7 @@ Client names start with an ASCII letter and accept up to 15 letters, digits, dot
 - A restore changing the tunnel subnet while a legacy VPC policy is active stops before mutation; plan that migration separately.
 - Removing this script's forwarding configuration does not force the shared runtime IPv4-forwarding setting off, because another service may need it.
 
-The release artifact passed 418 offline development tests and a Gitleaks scan with no findings. The development tests are not included in this minimal distribution. Real Linux firewall behavior, systemd reboot ordering, QR decoding and client connectivity still require deployment acceptance testing.
+The release artifact passed 427 offline development tests, including real pseudo-terminal confirmation regressions and a Gitleaks scan with no findings. The development tests are not included in this minimal distribution. Real Linux firewall behavior, systemd reboot ordering, QR decoding and client connectivity still require deployment acceptance testing.
 
 ## Download statistics
 
