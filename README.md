@@ -22,10 +22,10 @@ sudo bash ./setup-wireguard.sh
 
 The main menu offers:
 
-1. Install a new instance.
-2. Select and manage an existing instance.
-3. Install the optional `awg-manage` command shortcut.
-0. Exit without changes.
+- **1**: Install a new instance.
+- **2**: Select and manage an existing instance.
+- **3**: Install the optional `awg-manage` command shortcut.
+- **0**: Exit without changes.
 
 Shortcut installation requires a stable, root-owned script location and trusted parent directories. After confirmation it creates `/usr/local/bin/awg-manage` as a symbolic link, not a second copy. Existing different commands are retained. Keep the original script in place.
 
