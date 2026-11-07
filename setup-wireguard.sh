@@ -4,6 +4,8 @@ set +x
 set -Eeuo pipefail
 umask 077
 
+EASY_AWG_VERSION=v2026-11-08-2
+
 # Edit these defaults or supply environment variables when invoking the script.
 # The wizard shows each default and lets you replace it before installation.
 PUBLIC_IP=${PUBLIC_IP:-}
@@ -777,6 +779,15 @@ def valid_name(value):
     return value
 
 
+CLIENT_NAME_PATTERN = r'[A-Za-z][A-Za-z0-9_.-]{0,14}'
+
+
+def valid_client_name(value):
+    if not isinstance(value, str) or not re.fullmatch(CLIENT_NAME_PATTERN, value):
+        fail('Use 1-15 letters, digits, underscores, hyphens, or dots, starting with a letter.')
+    return value
+
+
 def valid_port(value):
     value = str(value)
     if not re.fullmatch(r'[1-9][0-9]{0,4}', value) or int(value) > 65535:
@@ -1222,7 +1233,7 @@ def lifecycle_accounts(text, public):
         fail('Invalid account lifecycle metadata.')
     seen = set()
     for name, record in data['accounts'].items():
-        valid_name(name)
+        valid_client_name(name)
         if (not isinstance(record, dict) or set(record) != {'public', 'disabled', 'expires_at', 'peer'}
                 or type(record['disabled']) is not bool):
             fail('Invalid account lifecycle record.')
@@ -1299,6 +1310,22 @@ def lifecycle_write(path, text, old, interface):
 def lifecycle_unit_state(unit, action):
     result = subprocess.run(['systemctl', action, unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
     return result.returncode == 0
+
+
+def lifecycle_refresh_expiry(manager):
+    helper = lifecycle_paths(manager.interface)[0]
+    if not exists(helper):
+        return
+    old = lifecycle_read_owned(helper, manager.interface)
+    program = read_profile(Path(__file__))
+    compile(program, '<awg-expiry-helper>', 'exec')
+    marker = LIFECYCLE_MARKER + manager.interface + '\n'
+    if program.startswith(marker):
+        program = program[len(marker):]
+    proposed = marker + program
+    if proposed != old:
+        lifecycle_write(helper, proposed, old, manager.interface)
+        print('Updated the existing expiry helper; timer and service settings are unchanged.')
 
 
 def lifecycle_install_expiry(manager, source=None):
@@ -1482,7 +1509,7 @@ class Manager:
             for path in sorted(self.client_dir.iterdir()):
                 if path.suffix != '.conf':
                     continue
-                name = valid_name(path.stem)
+                name = valid_client_name(path.stem)
                 if name == 'initial':
                     fail('The name initial is reserved for the existing flat or legacy profile.')
                 paths.append((name, path))
@@ -1634,19 +1661,25 @@ class Manager:
         print('Accounts are AmneziaWG peers, not Linux users. Handshake status is not a service health check.')
 
     def selected(self, name):
-        valid_name(name)
+        valid_client_name(name)
         if name not in self.clients:
             fail('No stored client with that account name; untracked peers are retained.')
         return self.clients[name]
 
-    def export_client(self, name, destination):
+    def export_client(self, name, destination=None):
         client = self.selected(name)
+        if destination is None or destination == '':
+            confirm('Display the complete client profile, including its private key, PSK, and header-protection key. '
+                    'Terminal scrollback and session recordings (including Jumpserver) may retain these secrets.')
+            self.unchanged()
+            sys.stdout.write(self.files[client['path']])
+            return
         destination = secure_path(Path(destination), private_parent=True)
         if destination == self.base or self.base in destination.parents:
             fail('Export outside the AmneziaWG configuration directory so managed profiles stay unchanged.')
         if destination.suffix != '.conf':
             fail('Export to a .conf file with a AmneziaWG-compatible filename.')
-        valid_name(destination.stem)
+        valid_client_name(destination.stem)
         if exists(destination):
             fail('Export destination already exists; it was retained.')
         confirm('Export a secret client profile to ' + str(destination) + '. Keep it private and transfer it securely.')
@@ -1756,7 +1789,7 @@ class Manager:
         print('Private backups: ' + str(backup))
 
     def add_client(self, name):
-        valid_name(name)
+        valid_client_name(name)
         if name == 'initial' or name in self.clients:
             fail('That account name is reserved or already exists.')
         self.require_active()
@@ -1798,6 +1831,9 @@ class Manager:
         self.unchanged()
         if route_path.is_symlink() or route_path.exists() != (route_text is not None) or (route_text is not None and (route_path.is_symlink() or not route_path.is_file() or route_path.read_text() != route_text)):
             fail('Client route policy changed during confirmation; retry.')
+        if '.' in name:
+            # An older persisted helper rejects dotted profiles, including when enforcing expiry for other accounts.
+            lifecycle_refresh_expiry(self)
         private = key(run('awg', 'genkey'))
         public = key(run('awg', 'pubkey', data=private + '\n'))
         psk = key(run('awg', 'genpsk'))
@@ -2007,9 +2043,12 @@ def dispatch(arguments):
     if len(arguments) < 2:
         fail('Supply an operation and AmneziaWG interface.')
     operation, interface, *values = arguments
-    counts = {'--list-clients': 0, '--add-client': 1, '--export-client': 2, '--remove-client': 1, '--set-port': 1}
-    if operation not in counts or len(values) != counts[operation]:
+    counts = {'--list-clients': (0, 0), '--add-client': (1, 1), '--export-client': (1, 2),
+              '--remove-client': (1, 1), '--set-port': (1, 1)}
+    if operation not in counts or not counts[operation][0] <= len(values) <= counts[operation][1]:
         fail('Invalid management arguments; use --help for the command forms.')
+    if any(value.startswith('--') for value in values):
+        fail('Unexpected option; see --help for command forms.')
     manager = Manager(interface)
     methods = {'--list-clients': manager.list_clients, '--add-client': manager.add_client,
                '--export-client': manager.export_client, '--remove-client': manager.remove_client,
@@ -2033,7 +2072,8 @@ def main(arguments=None):
             elif choice == '2':
                 dispatch(['--list-clients', interface])
             elif choice == '3':
-                dispatch(['--export-client', interface, prompt('Account name: '), prompt('Absolute destination .conf path: ')])
+                dispatch(['--export-client', interface, prompt('Account name: '),
+                          prompt('Absolute destination .conf path (blank to display in terminal): ')])
             elif choice == '4':
                 dispatch(['--remove-client', interface, prompt('Account name: ')])
             elif choice == '5':
@@ -2125,7 +2165,7 @@ def network_state(manager):
     elif state['egress'] is not None or state['dns']:
         fail('Split mode must not retain an Internet egress policy.')
     for name, original in state['clients'].items():
-        valid_name(name)
+        valid_client_name(name)
         if not isinstance(original, dict) or set(original) != {'public', 'address', 'dns', 'allowed'}:
             fail('Invalid saved split profile fields.')
         key(original['public'])
@@ -2137,7 +2177,7 @@ def network_state(manager):
         for value in original['allowed'].split(','):
             ipaddress.ip_network(value.strip(), strict=False)
     for name, policy in state['access'].items():
-        valid_name(name)
+        valid_client_name(name)
         if not isinstance(policy, dict) or set(policy) != {'public', 'address', 'rules'}:
             fail('Invalid saved access policy.')
         key(policy['public'])
@@ -2571,7 +2611,7 @@ def network_restore_fields(text, original):
 
 
 def network_set_access(manager, name, rules=None, preview=False):
-    valid_name(name)
+    valid_client_name(name)
     state = network_state(manager)
     if rules is None:
         print('Rules: IPv4CIDR:tcp|udp:PORT, IPv4CIDR:icmp, IPv4CIDR:any. inherit removes restrictions; deny blocks all.')
@@ -2693,7 +2733,7 @@ def ops_allowed(interface, path):
     if path in fixed:
         return True
     return (path.parent == OPS_BASE / 'clients' / interface and path.suffix == '.conf'
-            and bool(re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,14}', path.stem)) and path.stem != 'initial')
+            and bool(re.fullmatch(CLIENT_NAME_PATTERN, path.stem)) and path.stem != 'initial')
 
 
 def ops_manager(interface):
@@ -2716,7 +2756,7 @@ def ops_owned_paths(manager):
         if exists(path):
             paths.add(path)
     if 'network_owned_paths' in globals():
-        paths.update(network_owned_paths(manager.interface, base=OPS_BASE))
+        paths.update(path for path in network_owned_paths(manager.interface, base=OPS_BASE) if exists(path))
     if 'lifecycle_owned_paths' in globals():
         paths.update(lifecycle_owned_paths(manager.interface))
     for path in paths:
@@ -3384,9 +3424,22 @@ def ops_doctor(interface):
     print('These are local observations, not an end-to-end health check. Cloud firewall, return path, client DNS, and client browsing remain unverified.')
 
 
-def ops_export_qr(interface, name, destination):
+def ops_export_qr(interface, name, destination=None):
     manager = ops_manager(interface)
     client = manager.selected(name)
+    if destination is None or destination == '':
+        encoder = ops_shutil.which('qrencode')
+        if not encoder:
+            fail('Optional command qrencode is not installed; text profile export remains available.')
+        confirm('Display a QR code containing the complete client profile, including its private key, PSK, and header-protection key. '
+                'Terminal scrollback and session recordings (including Jumpserver) may retain these secrets.')
+        manager.unchanged()
+        result = ops_command(encoder, '-t', 'ANSIUTF8', '-o', '-', input=manager.files[client['path']], required=False)
+        if result.returncode or not result.stdout.strip() or len(result.stdout.encode()) > OPS_LIMIT:
+            fail('QR encoder failed or returned unexpected output; private output was suppressed.')
+        manager.unchanged()
+        sys.stdout.write(result.stdout)
+        return
     destination = secure_path(Path(destination), private_parent=True)
     if destination.suffix.lower() != '.png' or destination == OPS_BASE or OPS_BASE in destination.parents:
         fail('Export QR to a new .png file outside the managed configuration tree.')
@@ -3442,7 +3495,7 @@ def admin_dispatch(arguments):
         preview = False
     counts = {
         '--doctor': (0, 0), '--backup': (0, 1), '--restore': (1, 1),
-        '--uninstall': (0, 0), '--export-qr': (2, 2),
+        '--uninstall': (0, 0), '--export-qr': (1, 2),
         '--disable-client': (1, 1), '--enable-client': (1, 1),
         '--set-expiry': (2, 2), '--enforce-expiry': (0, 0),
         '--configure-network': (0, 1), '--set-access': (1, 65),
@@ -3461,7 +3514,7 @@ def admin_dispatch(arguments):
     if operation == '--uninstall':
         return ops_uninstall(interface, preview=preview)
     if operation == '--export-qr':
-        return ops_export_qr(interface, values[0], values[1])
+        return ops_export_qr(interface, values[0], values[1] if len(values) > 1 else None)
     if operation == '--enforce-expiry':
         return lifecycle_expiry_main(interface)
     if operation == '--assert-vpc-compatible':
@@ -3472,7 +3525,7 @@ def admin_dispatch(arguments):
             fail('Traffic mode must be split or full.')
         return network_configure(Manager(interface), mode=mode, preview=preview)
     if operation == '--set-access':
-        valid_name(values[0])
+        valid_client_name(values[0])
         return network_set_access(Manager(interface), values[0],
                                   rules=values[1:] or None, preview=preview)
     manager = Manager(interface)
@@ -3498,7 +3551,7 @@ def main(arguments=None):
               '7) Split / full traffic mode\n8) Client access permissions\n'
               '9) Disable client\n10) Enable client\n11) Client expiry\n'
               '12) Redacted diagnostics\n13) Private backup\n14) Restore backup\n'
-              '15) Export private QR image\n16) Uninstall this interface\n0) Exit')
+              '15) Export client QR (terminal or PNG)\n16) Uninstall this interface\n0) Exit')
         choice = prompt('Select: ')
         if choice == '0':
             return 0
@@ -3514,7 +3567,7 @@ def main(arguments=None):
             admin_dispatch([named[choice], interface, prompt('Account name: ')])
         elif choice == '3':
             admin_dispatch(['--export-client', interface, prompt('Account name: '),
-                            prompt('Absolute destination .conf path: ')])
+                            prompt('Absolute destination .conf path (blank to display in terminal): ')])
         elif choice == '5':
             admin_dispatch(['--set-port', interface, prompt('New UDP port: ')])
         elif choice == '11':
@@ -3527,7 +3580,7 @@ def main(arguments=None):
             admin_dispatch(['--restore', interface, prompt('Absolute private backup directory: ')])
         elif choice == '15':
             admin_dispatch(['--export-qr', interface, prompt('Account name: '),
-                            prompt('New absolute private .png path: ')])
+                            prompt('New absolute private .png path (blank for terminal QR): ')])
         elif choice == '16':
             admin_dispatch(['--uninstall', interface])
             return 0
@@ -3800,6 +3853,107 @@ def prompt(label, default):
     return answer.strip() or default
 
 
+
+def choose_number(label, options, default=''):
+    """Accept a displayed number or an exact value, preserving manual input."""
+    if not options:
+        fail('No eligible choices are available for ' + label + '.')
+    values = [value for value, _ in options]
+    for index, (_, description) in enumerate(options, 1):
+        print(str(index) + ') ' + description)
+    default_number = str(values.index(default) + 1) if default in values else ''
+    while True:
+        answer = prompt(label + ' (number or value)', default_number)
+        if answer.isascii() and answer.isdecimal() and 1 <= int(answer) <= len(options):
+            return values[int(answer) - 1]
+        if answer in values:
+            return answer
+        print('Choose a displayed number or value.')
+
+
+def vpc_interfaces(awg_interfaces, vpn_address):
+    defaults = {route.get('dev') for route in json.loads(run('ip', '-j', '-4', 'route', 'show', 'default'))}
+    entries = json.loads(run('ip', '-j', '-4', 'address', 'show'))
+    result = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get('ifname', '')
+        if not isinstance(name, str):
+            continue
+        if name in defaults or name in awg_interfaces or name == 'lo' or 'UP' not in (entry.get('flags') or []):
+            continue
+        try:
+            valid_interface(name)
+        except ValueError:
+            continue
+        addresses = []
+        for item in entry.get('addr_info') or []:
+            if not isinstance(item, dict) or item.get('family') != 'inet':
+                continue
+            try:
+                addresses.append(ipaddress.IPv4Interface(item['local'] + '/' + str(item['prefixlen'])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        addresses = [address for address in addresses
+                     if any(address.network.subnet_of(private) for private in PRIVATE)
+                     and not address.network.overlaps(vpn_address.network)]
+        if addresses:
+            result[name] = addresses
+    return result
+
+
+def choose_vpc_target(assigned, saved=None):
+    networks = list(dict.fromkeys(str(address.network) for address in assigned))
+    local_ips = {address.ip for address in assigned}
+    def validate(value):
+        target = target_network(value)
+        network = ipaddress.IPv4Network(target)
+        if not any(network.subnet_of(address.network) for address in assigned):
+            fail('The complete target must be on the selected private interface subnet.')
+        if network.prefixlen == 32 and network.network_address in local_ips:
+            fail('Choose the remote server address, not this gateway address.')
+        return target
+    try:
+        saved = validate(saved) if saved else None
+    except ValueError:
+        saved = None
+    options = ([(saved, 'Keep saved target: ' + saved)] if saved else [])
+    options += [('custom', 'Enter a remote server IPv4 or custom CIDR (single host uses /32)')]
+    options += [(network, 'Entire connected subnet: ' + network + ' (all addresses, not one server)') for network in networks]
+    print('Target means the remote server or network to access, not this gateway address.')
+    print('Remote server addresses are not discovered from local interfaces; use the target server VPC address.')
+    for index, (_, description) in enumerate(options, 1):
+        print(str(index) + ') ' + description)
+    while True:
+        answer = prompt('3/4 VPC target choice (number or IPv4/CIDR)', '1')
+        if answer.isascii() and answer.isdecimal() and 1 <= int(answer) <= len(options):
+            answer = options[int(answer) - 1][0]
+        if answer == 'custom':
+            answer = prompt('Remote server IPv4 or network-aligned CIDR', '')
+        try:
+            return validate(answer)
+        except ValueError as error:
+            print(str(error))
+
+
+def choose_vpc_policy(awg_interfaces, vpn_address, old):
+    candidates = vpc_interfaces(awg_interfaces, vpn_address)
+    print('Private exit interfaces below belong to this AWG gateway, not the remote target server.')
+    options = [(name, name + ' | gateway ' + ', '.join(str(address.ip) for address in addresses)
+                + ' | connected subnet ' + ', '.join(dict.fromkeys(str(address.network) for address in addresses)))
+               for name, addresses in candidates.items()]
+    default = old['out'] if old and old['out'] in candidates else next(iter(candidates)) if len(candidates) == 1 else ''
+    outbound = choose_number('2/4 VPC exit interface', options, default)
+    assigned = candidates[outbound]
+    target = choose_vpc_target(assigned, old['target'] if old else None)
+    matching = [address for address in assigned if ipaddress.IPv4Network(target).subnet_of(address.network)]
+    sources = list(dict.fromkeys(str(address.ip) for address in matching))
+    default = old['snat'] if old and old['snat'] in sources else sources[0] if len(sources) == 1 else ''
+    snat = choose_number('4/4 Gateway SNAT IPv4', [(source, source + ' (local gateway on ' + outbound + ')') for source in sources], default)
+    return target, outbound, snat
+
+
 def route_details(target, source=None, incoming=None):
     command = ['ip', '-j', '-4', 'route', 'get', str(ipaddress.ip_network(target).network_address)]
     if source:
@@ -3921,7 +4075,7 @@ def account_records(text, public, peers):
         fail('Invalid account lifecycle metadata.')
     identities = set()
     for name, record in data['accounts'].items():
-        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,14}', name):
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,14}', name):
             fail('Invalid account name in lifecycle metadata.')
         if (not isinstance(record, dict) or set(record) != {'public', 'disabled', 'expires_at', 'peer'}
                 or type(record['disabled']) is not bool):
@@ -4038,7 +4192,8 @@ def main(argv=None):
     if not available:
         fail('Create and activate an AWG interface before configuring VPC access.')
     print('Active AWG interfaces: ' + ', '.join(available))
-    interface = valid_interface(args.interface or prompt('1/4 AWG interface', available[0] if len(available) == 1 else ''))
+    interface = valid_interface(args.interface or choose_number(
+        '1/4 AWG interface', [(name, name) for name in available], available[0] if len(available) == 1 else ''))
     if interface not in available:
         fail('Choose an active AWG interface.')
     server_path = BASE / (interface + '.conf')
@@ -4092,15 +4247,7 @@ def main(argv=None):
     if args.preview and old:
         target, outbound, snat = old['target'], old['out'], old['snat']
     else:
-        target = target_network(prompt('2/4 VPC target IPv4 or CIDR', old['target'] if old else ''))
-        network = ipaddress.IPv4Network(target)
-        representative = network.network_address + (1 if network.prefixlen < 31 else 0)
-        suggested = old['out'] if old else route_details(str(representative) + '/32').get('dev', '')
-        outbound = valid_interface(prompt('3/4 VPC exit interface (not public interface)', suggested))
-        assigned = interface_addresses(outbound)
-        candidates = [str(a.ip) for a in assigned if ipaddress.IPv4Network(target).subnet_of(a.network)]
-        default_source = old['snat'] if old and old['snat'] in candidates else candidates[0] if len(candidates) == 1 else ''
-        snat = str(ipaddress.IPv4Address(prompt('4/4 VPC SNAT IPv4 on this interface', default_source)))
+        target, outbound, snat = choose_vpc_policy(available, vpn_address, old)
     policy = dict(interface=interface, source=source, target=target, out=outbound, snat=snat)
     validate_route(policy, vpn_address)
     clients = collect_clients(public, peers, interface, accounts)
@@ -4274,6 +4421,340 @@ PY_VPC_WIZARD
 entry_prompt() {
     IFS= read -r -p "$2" "$1" < /dev/tty
 }
+
+entry_update() (
+    local script=${BASH_SOURCE[0]}
+    (( $# == 0 )) || { (( $# == 1 )) && [[ $1 == --check ]]; } || {
+        say 'Use --update or --check-update without extra arguments.' >&2
+        return 1
+    }
+    (( EUID == 0 )) || { say 'Run script updates as root.' >&2; return 1; }
+    [[ $(uname -s) == Linux ]] || { say 'Run script updates on the Linux AWG server.' >&2; return 1; }
+    command -v python3 >/dev/null || { say 'Python 3 is required to check script updates.' >&2; return 1; }
+    if [[ ${1:-} != --check ]]; then
+        command -v flock >/dev/null || { say 'The flock command is required to update this script.' >&2; return 1; }
+        acquire_lock || return
+    fi
+    python3 - "$script" "$@" <<'PY_UPDATER'
+"""Update only the trusted standalone script from a verified GitHub Release."""
+import datetime
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+REPOSITORY = 'Accec/easy-awg'
+API_URL = 'https://api.github.com/repos/' + REPOSITORY + '/releases/latest'
+ROOT_UID = 0
+SCRIPT_LIMIT = 4 * 1024 * 1024
+METADATA_LIMIT = 1024 * 1024
+CHECKSUM_LIMIT = 4096
+HOSTS = {'api.github.com', 'github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'}
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def version_tuple(value):
+    if not isinstance(value, str):
+        fail('The release version is invalid.')
+    match = re.fullmatch(r'v(\d{4})-(\d{2})-(\d{2})-([1-9][0-9]*)', value, flags=re.ASCII)
+    if not match or len(value) > 40:
+        fail('Use a release version formatted as vYYYY-MM-DD-N.')
+    year, month, day, index = map(int, match.groups())
+    datetime.date(year, month, day)
+    return year, month, day, index
+
+
+def script_version(data):
+    if not data.startswith(b'#!/usr/bin/env bash\n') or b'\0' in data:
+        fail('The script does not have the expected Bash header.')
+    markers = re.findall(rb'^EASY_AWG_VERSION=([^\r\n]+)$', data, re.M)
+    if len(markers) != 1:
+        fail('The script needs one EASY_AWG_VERSION marker; retain it for manual review.')
+    try:
+        version = markers[0].decode('ascii')
+    except UnicodeError:
+        fail('The script version is not ASCII.')
+    version_tuple(version)
+    return version
+
+
+def checked_url(url):
+    if not isinstance(url, str):
+        fail('Unexpected download URL.')
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme != 'https' or parsed.netloc not in HOSTS or parsed.fragment
+            or any(ord(character) < 33 or ord(character) > 126 for character in url)):
+        fail('Downloads require HTTPS on the expected GitHub hosts.')
+    return url
+
+
+class GitHubRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        checked_url(newurl)
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
+
+
+def fetch(url, limit):
+    checked_url(url)
+    request = urllib.request.Request(url, headers={
+        'User-Agent': 'easy-awg-updater', 'Accept': 'application/vnd.github+json' if url == API_URL else 'application/octet-stream',
+        'Accept-Encoding': 'identity',
+    })
+    try:
+        with urllib.request.build_opener(GitHubRedirects()).open(request, timeout=30) as response:
+            checked_url(response.geturl())
+            if response.status != 200:
+                fail('GitHub returned an unexpected HTTP status.')
+            length = response.headers.get('Content-Length')
+            if length is not None and (not re.fullmatch(r'[0-9]+', length) or int(length) > limit):
+                fail('The download exceeds its size limit.')
+            data = response.read(limit + 1)
+            if len(data) > limit or (length is not None and len(data) != int(length)):
+                fail('The download was oversized or incomplete.')
+            return data
+    except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException):
+        fail('GitHub download failed; the installed script was retained.')
+
+
+def release_metadata(data):
+    try:
+        release = json.loads(data)
+    except (ValueError, UnicodeError):
+        fail('GitHub release metadata is invalid.')
+    if (not isinstance(release, dict) or release.get('draft') is not False
+            or release.get('prerelease') is not False or not isinstance(release.get('assets'), list)):
+        fail('Expected a published stable GitHub Release.')
+    tag = release.get('tag_name')
+    version_tuple(tag)
+    assets = {}
+    for name, limit in [('setup-wireguard.sh', SCRIPT_LIMIT), ('SHA256SUMS', CHECKSUM_LIMIT)]:
+        matches = [item for item in release['assets'] if isinstance(item, dict) and item.get('name') == name]
+        if len(matches) != 1:
+            fail('The release must include exactly one script and one SHA256SUMS asset.')
+        asset = matches[0]
+        expected_url = 'https://github.com/' + REPOSITORY + '/releases/download/' + tag + '/' + name
+        if (asset.get('state') != 'uploaded' or type(asset.get('size')) is not int
+                or not 0 < asset['size'] <= limit or asset.get('browser_download_url') != expected_url):
+            fail('A release asset has unexpected state, size or download URL.')
+        digest = asset.get('digest')
+        if digest is not None and (not isinstance(digest, str) or not re.fullmatch(r'sha256:[a-f0-9]{64}', digest)):
+            fail('A release asset digest is invalid.')
+        assets[name] = asset
+    return tag, assets
+
+
+def download_asset(asset, limit):
+    data = fetch(asset['browser_download_url'], limit)
+    if len(data) != asset['size']:
+        fail('A release asset changed size or was truncated.')
+    digest = asset.get('digest')
+    if digest and digest != 'sha256:' + hashlib.sha256(data).hexdigest():
+        fail('A release asset differs from the selected release digest.')
+    return data
+
+
+def checksum(data):
+    match = re.fullmatch(rb'([a-f0-9]{64})  setup-wireguard\.sh\n?', data)
+    if not match:
+        fail('SHA256SUMS must contain exactly one unambiguous setup-wireguard.sh record.')
+    return match[1].decode('ascii')
+
+
+def fingerprint(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode), info.st_nlink)
+
+
+def trusted_parents(directory):
+    if directory.resolve(strict=True) != directory or not str(directory).isprintable():
+        fail('Script directories must be canonical and free of symlinks.')
+    for parent in (directory, *directory.parents):
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != ROOT_UID or info.st_mode & 0o022:
+            fail('Script directories must be root-owned and not writable by other accounts.')
+
+
+def read_source(invoked):
+    invoked = Path(os.path.abspath(invoked))
+    if not str(invoked).isprintable():
+        fail('The script path must be printable.')
+    trusted_parents(invoked.parent)
+    entry = invoked.lstat()
+    target = invoked
+    if stat.S_ISLNK(entry.st_mode):
+        if entry.st_uid != ROOT_UID:
+            fail('The command shortcut must be root-owned.')
+        link = Path(os.readlink(invoked))
+        target = Path(os.path.abspath(link if link.is_absolute() else invoked.parent / link))
+    trusted_parents(target.parent)
+    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != ROOT_UID or info.st_nlink != 1
+                or info.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID) or info.st_size > SCRIPT_LIMIT):
+            fail('The script must be one trusted root-owned regular file without unsafe permissions or hard links.')
+        data = stream.read(SCRIPT_LIMIT + 1)
+        if len(data) != info.st_size or fingerprint(os.fstat(stream.fileno())) != fingerprint(info):
+            fail('The script changed while it was being read.')
+    return target, info, data
+
+
+def unchanged(invoked, original):
+    current = read_source(invoked)
+    if current[0] != original[0] or fingerprint(current[1]) != fingerprint(original[1]) or current[2] != original[2]:
+        fail('The installed script or command shortcut changed; the current version was retained.')
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def staged_file(directory, prefix, data, mode, owner):
+    fd, name = tempfile.mkstemp(prefix=prefix, dir=directory)
+    path = Path(name)
+    try:
+        with os.fdopen(fd, 'wb') as output:
+            os.fchown(output.fileno(), owner.st_uid, owner.st_gid)
+            os.fchmod(output.fileno(), mode)
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+            info = os.fstat(output.fileno())
+        return path, info
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def confirm():
+    with open('/dev/tty', 'r+', encoding='utf-8') as terminal:
+        terminal.write('Type APPLY to replace only this script and retain a private backup: ')
+        terminal.flush()
+        return terminal.readline().strip() == 'APPLY'
+
+
+def install_candidate(invoked, original, candidate, tag):
+    target, owner, old = original
+    temporary = None
+    backup = None
+    staged_info = None
+    try:
+        unchanged(invoked, original)
+        temporary, staged_info = staged_file(target.parent, '.easy-awg-update-', candidate, stat.S_IMODE(owner.st_mode), owner)
+        result = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-n', str(temporary)],
+                                capture_output=True, timeout=30, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        if result.returncode:
+            fail('The release script failed Bash syntax validation; the installed script was retained.')
+        unchanged(invoked, original)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        backup, _ = staged_file(target.parent, target.name + '.backup-' + stamp + '-', old, 0o600, owner)
+        sync_directory(target.parent)
+        unchanged(invoked, original)
+        os.replace(temporary, target)
+        sync_directory(target.parent)
+        unchanged(invoked, (target, staged_info, candidate))
+    except BaseException as error:
+        restored = False
+        try:
+            current = read_source(invoked)
+            if (staged_info is not None and current[0] == target
+                    and fingerprint(current[1]) == fingerprint(staged_info) and current[2] == candidate):
+                rollback, _ = staged_file(target.parent, '.easy-awg-rollback-', old, stat.S_IMODE(owner.st_mode), owner)
+                try:
+                    unchanged(invoked, current)
+                    os.replace(rollback, target)
+                    sync_directory(target.parent)
+                    restored = True
+                finally:
+                    rollback.unlink(missing_ok=True)
+        except BaseException:
+            fail('Update failed; review the current script and private backup before retrying: ' + str(backup))
+        if backup is not None:
+            print('Private previous-script backup: ' + str(backup))
+        if restored:
+            fail('Update failed after replacement; the previous script was restored.')
+        if isinstance(error, ValueError):
+            raise
+        fail('Update failed; the current script was retained.')
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    print('Updated script to ' + tag + ': ' + str(target))
+    print('Private previous-script backup: ' + str(backup))
+    print('AWG services, accounts and network configuration were not changed. Run the script again to use the new version.')
+
+
+def update_script(path, check_only=False):
+    original = read_source(path)
+    current = script_version(original[2])
+    tag, assets = release_metadata(fetch(API_URL, METADATA_LIMIT))
+    print('Installed script: ' + current)
+    print('Latest stable release: ' + tag)
+    if version_tuple(tag) < version_tuple(current):
+        print('The local version is newer than the published release; no downgrade was performed.')
+        return
+    digest = checksum(download_asset(assets['SHA256SUMS'], CHECKSUM_LIMIT))
+    if tag == current:
+        if digest != hashlib.sha256(original[2]).hexdigest():
+            fail('The same version has different content; the local script was retained for manual review.')
+        print('The installed script already matches this release.')
+        return
+    print('Update available: ' + current + ' -> ' + tag)
+    print('Target: ' + str(original[0]))
+    print('Only the script will change. A private backup is kept; AWG packages, services and configuration stay unchanged.')
+    print('The checksum verifies consistency with this GitHub Release; it is not an independent publisher signature.')
+    if check_only:
+        print('Check only; no script asset was downloaded and no files were changed.')
+        return
+    if not confirm():
+        print('Cancelled; no files changed.')
+        return
+    unchanged(path, original)
+    candidate = download_asset(assets['setup-wireguard.sh'], SCRIPT_LIMIT)
+    if hashlib.sha256(candidate).hexdigest() != digest:
+        fail('The script SHA256 does not match SHA256SUMS; the installed script was retained.')
+    if script_version(candidate) != tag:
+        fail('The downloaded script version differs from the selected release tag.')
+    install_candidate(path, original, candidate, tag)
+
+
+def main(argv=None):
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    if os.geteuid() != 0 or sys.platform != 'linux':
+        fail('Run the updater as root on the Linux AWG server.')
+    if len(arguments) not in (1, 2) or (len(arguments) == 2 and arguments[1] != '--check'):
+        fail('Usage: updater SCRIPT_PATH [--check]')
+    update_script(arguments[0], check_only=len(arguments) == 2)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, subprocess.SubprocessError, KeyboardInterrupt):
+        # Avoid printing network response bodies, signed redirect URLs, or downloaded script text.
+        message = str(sys.exc_info()[1]) if isinstance(sys.exc_info()[1], ValueError) else 'Update stopped; inspect the current script and any retained private backup.'
+        print('ERROR: ' + message, file=sys.stderr)
+        sys.exit(1)
+
+PY_UPDATER
+)
 
 entry_install_command() {
     (( $# == 0 )) || { say 'Use --install-command without extra arguments.' >&2; return 1; }
@@ -4524,6 +5005,7 @@ entry_menu() {
         say '1) Install a new instance'
         say '2) Manage an existing instance'
         say '3) Install command shortcut (awg-manage)'
+        say '4) Check / update script'
         say '0) Exit'
         entry_prompt choice 'Select: ' || return 0
         case $choice in
@@ -4546,7 +5028,16 @@ entry_menu() {
                     say "Shortcut installation exited with status $status. Existing commands were retained." >&2
                 fi
                 ;;
-            *) say 'Choose 1, 2, 3, or 0.' ;;
+            4)
+                if entry_run --update; then
+                    # Stop the old menu even when the child replaced the script on disk.
+                    return 0
+                else
+                    status=$?
+                    say "Script update exited with status $status. Review the messages above before retrying." >&2
+                fi
+                ;;
+            *) say 'Choose 1, 2, 3, 4, or 0.' ;;
         esac
     done
 }
@@ -4556,6 +5047,19 @@ main() {
         entry_menu
         return
     fi
+    case ${1:-} in
+        --version)
+            (( $# == 1 )) || die 'Use --version without extra arguments.'
+            say "$EASY_AWG_VERSION"
+            return
+            ;;
+        --update|--check-update)
+            local update_command=$1
+            (( $# == 1 )) || die 'Use --update or --check-update without extra arguments.'
+            if [[ $update_command == --check-update ]]; then entry_update --check; else entry_update; fi
+            return
+            ;;
+    esac
     if [[ ${1:-} == --install-command ]]; then
         shift
         entry_install_command "$@"
@@ -4565,14 +5069,19 @@ main() {
         say 'Usage: sudo bash setup-manage-amneziawg.sh  (interactive main menu)'
         say '       sudo bash setup-manage-amneziawg.sh --install'
         say '       sudo bash setup-manage-amneziawg.sh --install-command'
-        say 'No arguments opens the main menu: install, manage an existing instance, or install a command shortcut.'
+        say '       sudo bash setup-manage-amneziawg.sh --version'
+        say '       sudo bash setup-manage-amneziawg.sh --check-update'
+        say '       sudo bash setup-manage-amneziawg.sh --update'
+        say 'No arguments opens the main menu: install, manage an existing instance, install a command shortcut, or update the script.'
+        say 'Updates use Accec/easy-awg stable Release assets and SHA256SUMS, require APPLY, back up the old script, and never downgrade.'
+        say 'Only this script is replaced; AWG packages, running services, saved accounts, and network policies remain unchanged. Re-run after updating.'
         say 'Shortcut installation links /usr/local/bin/awg-manage to this script after APPLY; existing different commands remain untouched.'
         say '       sudo bash setup-manage-amneziawg.sh --enable-psk INTERFACE [CLIENT_PROFILE]'
         say '       sudo bash setup-manage-amneziawg.sh --check INTERFACE [CLIENT_PROFILE]'
         say '       sudo bash setup-manage-amneziawg.sh --manage INTERFACE'
         say '       sudo bash setup-manage-amneziawg.sh --add-client INTERFACE NAME'
         say '       sudo bash setup-manage-amneziawg.sh --list-clients INTERFACE'
-        say '       sudo bash setup-manage-amneziawg.sh --export-client INTERFACE NAME /ABSOLUTE/NAME.conf'
+        say '       sudo bash setup-manage-amneziawg.sh --export-client INTERFACE NAME [/ABSOLUTE/NAME.conf]'
         say '       sudo bash setup-manage-amneziawg.sh --remove-client INTERFACE NAME'
         say '       sudo bash setup-manage-amneziawg.sh --set-port INTERFACE PORT'
         say '       sudo bash setup-manage-amneziawg.sh --configure-vpc [INTERFACE] [--preview]'
@@ -4586,7 +5095,7 @@ main() {
         say '       sudo bash setup-manage-amneziawg.sh --backup INTERFACE [/ABSOLUTE/NEW_DIRECTORY]'
         say '       sudo bash setup-manage-amneziawg.sh --restore INTERFACE /ABSOLUTE/BACKUP_DIRECTORY [--preview]'
         say '       sudo bash setup-manage-amneziawg.sh --uninstall INTERFACE [--preview]'
-        say '       sudo bash setup-manage-amneziawg.sh --export-qr INTERFACE NAME /ABSOLUTE/NAME.png'
+        say '       sudo bash setup-manage-amneziawg.sh --export-qr INTERFACE NAME [/ABSOLUTE/NAME.png]'
         say 'Guided setup: seven prompts with editable defaults, input validation, then APPLY confirmation.'
         say 'MTU defaults to 1280; set AWG_MTU or choose auto or a manual value from 1280 to 1500 in the wizard.'
         say 'Installs AmneziaWG, creates one client with a PSK, and adds one public UDP rule to active UFW.'
@@ -4598,8 +5107,10 @@ main() {
         say 'Full mode provides IPv4 Internet egress, explicit DNS, and tunneled IPv6 blocking; it is not dual-stack Internet or a client kill switch.'
         say 'Access RULE: IPv4CIDR:tcp:PORT, IPv4CIDR:udp:PORT, IPv4CIDR:icmp, or IPv4CIDR:any. ACLs run on the gateway.'
         say 'Expiry uses UTC and a systemd timer. QR export requires an existing qrencode command; QR images contain private keys.'
+        say 'Omit the export path (or leave it blank in the menu) to display the profile or QR in the terminal after APPLY. Session recordings may capture secrets.'
         say 'Backups contain secrets. Restore/uninstall preview before confirmation and retain unrelated services and shared packages.'
         say 'Accounts are AmneziaWG peers. Named profiles: /etc/amnezia/amneziawg/clients/INTERFACE/NAME.conf; initial refers to the existing first profile.'
+        say 'Client names: 1-15 ASCII letters, digits, dots, underscores, or hyphens; start with a letter. Example: alice.mac.'
         say 'Peer/port changes and exports require APPLY. Keep a separate SSH/console session; port changes also require a manual cloud-firewall check.'
         say 'Requires AmneziaWG 3.1-compatible tools, kernel support, and clients; a standard WireGuard client does not support this profile.'
         say 'New installation uses the official Amnezia PPA after APPLY. Packages and repository additions remain if later setup fails.'
