@@ -4,7 +4,7 @@ set +x
 set -Eeuo pipefail
 umask 077
 
-EASY_AWG_VERSION=v2026-11-08-2
+EASY_AWG_VERSION=v2026-11-08-3
 
 # Edit these defaults or supply environment variables when invoking the script.
 # The wizard shows each default and lets you replace it before installation.
@@ -3536,6 +3536,33 @@ def admin_dispatch(arguments):
     return manager.set_expiry(values[0], values[1])
 
 
+def admin_choose_client(interface):
+    manager = Manager(interface)
+    names = sorted(manager.clients)
+    if not names:
+        print('No stored accounts for this instance. Add a client first.')
+        return None
+    print('\nChoose an existing account for ' + interface + ':')
+    print('Number\tAccount\tVPN IPv4\tState')
+    choices = {}
+    for number, name in enumerate(names, 1):
+        client = manager.clients[name]
+        state = 'disabled' if client.get('disabled') else 'active'
+        if client.get('expires_at') and lifecycle_expired(client['expires_at']):
+            state += ' (expired)'
+        print(str(number) + ')\t' + name + '\t' + str(client['address']) + '\t' + state)
+        choices[str(number)] = name
+    print('0) Back')
+    while True:
+        choice = prompt('Account number (0 to go back): ')
+        if choice == '0':
+            return None
+        if choice in choices:
+            manager.unchanged()
+            return choices[choice]
+        print('Choose an account number from 1 to ' + str(len(names)) + ', or 0 to go back.')
+
+
 def main(arguments=None):
     arguments = sys.argv[1:] if arguments is None else list(arguments)
     if os.geteuid() != 0 or sys.platform != 'linux':
@@ -3559,28 +3586,32 @@ def main(arguments=None):
             network_assert_vpc_compatible(interface)
             return 42  # The shell holds the lock while running the existing VPC wizard.
         simple = {'2': '--list-clients', '7': '--configure-network', '12': '--doctor'}
-        named = {'1': '--add-client', '4': '--remove-client', '8': '--set-access',
-                 '9': '--disable-client', '10': '--enable-client'}
-        if choice in simple:
+        accounts = {'3': '--export-client', '4': '--remove-client', '8': '--set-access',
+                    '9': '--disable-client', '10': '--enable-client', '11': '--set-expiry',
+                    '15': '--export-qr'}
+        if choice in accounts:
+            account = admin_choose_client(interface)
+            if account is None:
+                continue
+            values = [accounts[choice], interface, account]
+            if choice == '3':
+                values.append(prompt('Absolute destination .conf path (blank to display in terminal): '))
+            elif choice == '11':
+                values.append(prompt('Expiry UTC (YYYY-MM-DDTHH:MM:SSZ), or none: '))
+            elif choice == '15':
+                values.append(prompt('New absolute private .png path (blank for terminal QR): '))
+            admin_dispatch(values)
+        elif choice in simple:
             admin_dispatch([simple[choice], interface])
-        elif choice in named:
-            admin_dispatch([named[choice], interface, prompt('Account name: ')])
-        elif choice == '3':
-            admin_dispatch(['--export-client', interface, prompt('Account name: '),
-                            prompt('Absolute destination .conf path (blank to display in terminal): ')])
+        elif choice == '1':
+            admin_dispatch(['--add-client', interface, prompt('Account name: ')])
         elif choice == '5':
             admin_dispatch(['--set-port', interface, prompt('New UDP port: ')])
-        elif choice == '11':
-            admin_dispatch(['--set-expiry', interface, prompt('Account name: '),
-                            prompt('Expiry UTC (YYYY-MM-DDTHH:MM:SSZ), or none: ')])
         elif choice == '13':
             destination = prompt('New absolute backup directory (blank for automatic): ')
             admin_dispatch(['--backup', interface] + ([destination] if destination else []))
         elif choice == '14':
             admin_dispatch(['--restore', interface, prompt('Absolute private backup directory: ')])
-        elif choice == '15':
-            admin_dispatch(['--export-qr', interface, prompt('Account name: '),
-                            prompt('New absolute private .png path (blank for terminal QR): ')])
         elif choice == '16':
             admin_dispatch(['--uninstall', interface])
             return 0
@@ -5111,6 +5142,7 @@ main() {
         say 'Backups contain secrets. Restore/uninstall preview before confirmation and retain unrelated services and shared packages.'
         say 'Accounts are AmneziaWG peers. Named profiles: /etc/amnezia/amneziawg/clients/INTERFACE/NAME.conf; initial refers to the existing first profile.'
         say 'Client names: 1-15 ASCII letters, digits, dots, underscores, or hyphens; start with a letter. Example: alice.mac.'
+        say 'Existing-account menu actions show a numbered account list; select a number, or 0 to go back. CLI commands still take account names.'
         say 'Peer/port changes and exports require APPLY. Keep a separate SSH/console session; port changes also require a manual cloud-firewall check.'
         say 'Requires AmneziaWG 3.1-compatible tools, kernel support, and clients; a standard WireGuard client does not support this profile.'
         say 'New installation uses the official Amnezia PPA after APPLY. Packages and repository additions remain if later setup fails.'
