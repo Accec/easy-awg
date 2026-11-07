@@ -4,7 +4,7 @@ set +x
 set -Eeuo pipefail
 umask 077
 
-EASY_AWG_VERSION=v2026-11-08-4
+EASY_AWG_VERSION=v2026-11-08-5
 
 # Edit these defaults or supply environment variables when invoking the script.
 # The wizard shows each default and lets you replace it before installation.
@@ -13,10 +13,10 @@ PUBLIC_IF=${PUBLIC_IF:-}
 AWG_PORT=${AWG_PORT:-51820}
 AWG_IF=${AWG_IF:-awg-manage}
 SERVER_ADDRESS=${SERVER_ADDRESS:-10.78.0.1/24}
-CLIENT_ADDRESS=${CLIENT_ADDRESS:-10.78.0.2/32}
 AWG_MTU=${AWG_MTU:-1280}
 
-WORK='' AWG_FILE='' CLIENT_FILE=''
+WORK='' AWG_FILE='' CLIENT_DIR='' METADATA_FILE=''
+CLIENT_DIR_CREATED=0 METADATA_CREATED=0
 AWG_ATTEMPTED=0 RULE_ADDED=0 FILES_CREATED=0 SUCCESS=0
 UFW_RULE=()
 say() { printf '%s\n' "$*"; }
@@ -108,17 +108,18 @@ validate_vpn_interface() {
        [[ -e /etc/amnezia/amneziawg/$1.conf || -L /etc/amnezia/amneziawg/$1.conf ||
           -e /etc/amnezia/amneziawg/$1-client.conf || -L /etc/amnezia/amneziawg/$1-client.conf ||
            -e /etc/amnezia/amneziawg/clients/$1.conf || -L /etc/amnezia/amneziawg/clients/$1.conf ||
-           -e /etc/wireguard/$1.conf || -L /etc/wireguard/$1.conf ]]; then
+            -e /etc/amnezia/amneziawg/clients/$1 || -L /etc/amnezia/amneziawg/clients/$1 ||
+            -e /etc/wireguard/$1.conf || -L /etc/wireguard/$1.conf ]]; then
         say 'That AmneziaWG interface or configuration already exists. Choose a new name.' >&2
         return 1
     fi
 }
 
 validate_address() {
-    python3 - "$1" "$2" "$PUBLIC_IP" "$SERVER_ADDRESS" "$WORK" <<'PY_INPUT'
+    python3 - "$1" "$2" "$PUBLIC_IP" "$WORK" <<'PY_INPUT'
 import ipaddress, json, sys
 from pathlib import Path
-kind, value, public, server_value, work = sys.argv[1:]
+kind, value, public, work = sys.argv[1:]
 try:
     address = ipaddress.IPv4Address(value) if kind == 'public' else ipaddress.IPv4Interface(value)
 except ValueError:
@@ -141,28 +142,8 @@ elif kind == 'server':
         if existing.prefixlen and network.overlaps(existing):
             raise SystemExit('VPN subnet overlaps an existing server route: ' + destination)
 else:
-    server = ipaddress.IPv4Interface(server_value)
-    network = server.network
-    if not (address.network.prefixlen == 32 and address.ip in network
-            and address.ip not in (server.ip, network.network_address, network.broadcast_address)):
-        raise SystemExit('Use a distinct client address inside the server VPN subnet, with /32.')
+    raise SystemExit('Unknown address input type.')
 PY_INPUT
-}
-
-suggest_client_address() {
-    python3 - "$SERVER_ADDRESS" "$CLIENT_ADDRESS" <<'PY_CLIENT_DEFAULT'
-import ipaddress, sys
-server = ipaddress.IPv4Interface(sys.argv[1])
-try:
-    current = ipaddress.IPv4Interface(sys.argv[2])
-    if (current.network.prefixlen == 32 and current.ip in server.network
-            and current.ip not in (server.ip, server.network.network_address, server.network.broadcast_address)):
-        print(str(current))
-        raise SystemExit(0)
-except ValueError:
-    pass
-print(str(next(host for host in server.network.hosts() if host != server.ip)) + '/32')
-PY_CLIENT_DEFAULT
 }
 
 validate_mtu() {
@@ -175,7 +156,6 @@ validate_mtu() {
 }
 
 guide_inputs() {
-    local client_default
     say 'AmneziaWG setup wizard: press Enter to keep a displayed default; Ctrl+C cancels.'
     say 'Installation and firewall changes start only after the final APPLY confirmation.'
     say 'Current server IPv4 interfaces (read-only):'
@@ -183,7 +163,7 @@ guide_inputs() {
     if [[ -z $PUBLIC_IF ]]; then
         PUBLIC_IF=$(ip -j -4 route show default | python3 -c 'import json,sys; routes=json.load(sys.stdin); best=min((r.get("metric",0) for r in routes),default=None); names={r.get("dev","") for r in routes if r.get("metric",0)==best}; print(next(iter(names)) if len(names)==1 else "")') || return
     fi
-    prompt_value PUBLIC_IF '1/7 Public network interface' "$PUBLIC_IF" validate_public_interface || return
+    prompt_value PUBLIC_IF '1/6 Public network interface' "$PUBLIC_IF" validate_public_interface || return
     if [[ -z $PUBLIC_IP ]]; then
         PUBLIC_IP=$(python3 - "$WORK/addresses.json" <<'PY_DEFAULT_IP'
 import json, sys
@@ -193,15 +173,13 @@ print(next(iter(values)) if len(values) == 1 else '')
 PY_DEFAULT_IP
 ) || return
     fi
-    prompt_value PUBLIC_IP '2/7 Endpoint IPv4 on that interface' "$PUBLIC_IP" validate_address public || return
-    prompt_value AWG_PORT '3/7 AmneziaWG UDP port' "$AWG_PORT" validate_port || return
-    prompt_value AWG_IF '4/7 New AmneziaWG interface name' "$AWG_IF" validate_vpn_interface || return
+    prompt_value PUBLIC_IP '2/6 Endpoint IPv4 on that interface' "$PUBLIC_IP" validate_address public || return
+    prompt_value AWG_PORT '3/6 AmneziaWG UDP port' "$AWG_PORT" validate_port || return
+    prompt_value AWG_IF '4/6 New AmneziaWG interface name' "$AWG_IF" validate_vpn_interface || return
     say 'The VPN addresses below are new tunnel addresses, not existing public or client LAN addresses.'
-    prompt_value SERVER_ADDRESS '5/7 Server VPN address to create (CIDR)' "$SERVER_ADDRESS" validate_address server || return
-    client_default=$(suggest_client_address) || return
-    prompt_value CLIENT_ADDRESS '6/7 First client VPN address (/32)' "$client_default" validate_address client || return
-    say 'MTU: auto keeps automatic selection on each device; a number sets both tunnel profiles, not the public interface.'
-    prompt_value AWG_MTU '7/7 Tunnel MTU (auto or 1280-1500)' "$AWG_MTU" validate_mtu
+    prompt_value SERVER_ADDRESS '5/6 Server VPN address to create (CIDR)' "$SERVER_ADDRESS" validate_address server || return
+    say 'MTU: auto selects the server tunnel MTU; future clients inherit that value. A number sets the tunnel MTU, not the public interface.'
+    prompt_value AWG_MTU '6/6 Tunnel MTU (auto or 1280-1500)' "$AWG_MTU" validate_mtu
 }
 
 rollback() {
@@ -215,7 +193,9 @@ rollback() {
     if (( RULE_ADDED )); then
         ufw --force delete "${UFW_RULE[@]}" || say 'Review the newly added AmneziaWG UDP rule.' >&2
     fi
-    if (( FILES_CREATED )); then rm -f -- "$AWG_FILE" "$CLIENT_FILE"; fi
+    if (( FILES_CREATED )); then rm -f -- "$AWG_FILE"; fi
+    if (( METADATA_CREATED )); then rm -f -- "$METADATA_FILE"; fi
+    if (( CLIENT_DIR_CREATED )); then rmdir -- "$CLIENT_DIR" || say "Review the new client directory: $CLIENT_DIR" >&2; fi
 }
 
 finish() {
@@ -228,14 +208,11 @@ finish() {
 }
 
 write_profiles() {
-    local server_private client_private server_public client_public preshared header_key junk_count obfuscation mtu_line=''
+    local server_private server_public header_key junk_count obfuscation mtu_line=''
     validate_mtu "$AWG_MTU" || return
     if [[ $AWG_MTU != auto ]]; then mtu_line=$'\n'"MTU = $AWG_MTU"; fi
     server_private=$(awg genkey)
-    client_private=$(awg genkey)
     server_public=$(printf '%s\n' "$server_private" | awg pubkey)
-    client_public=$(printf '%s\n' "$client_private" | awg pubkey)
-    preshared=$(awg genpsk)
     header_key=$(awg genkey)
     junk_count=$(python3 -c 'import secrets; print(4 + secrets.randbelow(3))')
     # Official Amnezia client 3.1 fresh preset; the header-protection key is shared, not a peer identity.
@@ -264,26 +241,9 @@ Address = $SERVER_ADDRESS$mtu_line
 ListenPort = $AWG_PORT
 PrivateKey = $server_private
 $obfuscation
-
-[Peer]
-PublicKey = $client_public
-PresharedKey = $preshared
-AllowedIPs = $CLIENT_ADDRESS
 EOF
-    cat > "$WORK/client.conf" <<EOF
-[Interface]
-PrivateKey = $client_private
-Address = $CLIENT_ADDRESS$mtu_line
-$obfuscation
-
-[Peer]
-PublicKey = $server_public
-PresharedKey = $preshared
-Endpoint = $PUBLIC_IP:$AWG_PORT
-AllowedIPs = ${SERVER_ADDRESS%/*}/32
-PersistentKeepalive = 25-35
-EOF
-    unset server_private client_private preshared header_key obfuscation
+    printf '%s\n' "$server_public" > "$WORK/server-public.key"
+    unset server_private header_key obfuscation
 }
 
 check_awg_version() {
@@ -351,6 +311,53 @@ PY_AWG_DIRS
 }
 
 # shellcheck shell=bash
+write_server_metadata() {
+    ip -j link show dev "$AWG_IF" > "$WORK/tunnel.json"
+    python3 - "$PUBLIC_IP" "$AWG_PORT" "$WORK/server-public.key" "$WORK/tunnel.json" > "$WORK/metadata.json" <<'PY_SERVER_METADATA'
+import base64, ipaddress, json, sys
+from pathlib import Path
+public, port, key_file, link_file = sys.argv[1:]
+public = str(ipaddress.IPv4Address(public))
+port = int(port)
+key = Path(key_file).read_text().strip()
+try:
+    raw = base64.b64decode(key, validate=True)
+except ValueError:
+    raise SystemExit('Invalid generated server public key.') from None
+if len(raw) != 32 or base64.b64encode(raw).decode() != key or not 1 <= port <= 65535:
+    raise SystemExit('Invalid generated server metadata.')
+links = json.loads(Path(link_file).read_text())
+if len(links) != 1 or type(links[0].get('mtu')) is not int or not 576 <= links[0]['mtu'] <= 65535:
+    raise SystemExit('Unexpected running tunnel MTU.')
+print(json.dumps({'version': 1, 'server_public': key, 'endpoint': public + ':' + str(port),
+                  'mtu': links[0]['mtu']}, indent=2))
+PY_SERVER_METADATA
+    python3 - "$WORK/metadata.json" "$METADATA_FILE" <<'PY_PUBLISH_METADATA'
+import os, sys
+from pathlib import Path
+source, destination = map(Path, sys.argv[1:])
+data = source.read_bytes()
+owned = None
+try:
+    with destination.open('xb') as output:
+        info = os.fstat(output.fileno())
+        owned = (info.st_dev, info.st_ino)
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+except BaseException:
+    if owned is not None:
+        try:
+            current = destination.lstat()
+            if (current.st_dev, current.st_ino) == owned:
+                destination.unlink()
+        except FileNotFoundError:
+            pass
+    raise
+PY_PUBLISH_METADATA
+    METADATA_CREATED=1
+}
+
 update_psk() {
     python3 - "/etc/amnezia/amneziawg/$1.conf" "$2" "$1" "${3:-}" <<'PY_PSK'
 import base64
@@ -1576,6 +1583,8 @@ class Manager:
         network_path = self.base / (interface + '.network.json')
         if exists(network_path):
             self.files[network_path] = read_profile(network_path)
+        if 'dns_state' in globals():
+            dns_state(self)
 
     def require_active(self):
         if self.runtime is None:
@@ -1852,6 +1861,8 @@ class Manager:
         self.network_pending_changes = {}
         if 'network_new_client' in globals():
             client_text, peer_text = network_new_client(self, name, address, client_text, peer_text)
+        if 'dns_new_client' in globals():
+            client_text = dns_new_client(self, name, public, client_text, self.network_pending_changes)
         server_text = self.files[self.server_path]
         server_text += ('\n' if not server_text.endswith('\n') else '') + '\n' + peer_text
         peer = {'psk': psk, 'allowed': [address], 'keepalive': '0', 'endpoint': None, 'advanced_security': None}
@@ -1978,6 +1989,8 @@ class Manager:
         changes = {self.server_path: text, client['path']: None, self.metadata_path: self.metadata_text()}
         if name in self.accounts['accounts']:
             changes[self.accounts_path] = self.lifecycle_text(name, None)
+        if 'dns_remove_client' in globals():
+            dns_remove_client(self, name, changes)
         self.transaction(changes,
                          lambda: run('awg', 'set', self.interface, 'peer', public, 'remove') if self.runtime and not client.get('disabled') else None,
                          lambda: set_peer(self.interface, public, self.runtime['peers'][public]) if self.runtime and not client.get('disabled') else None,
@@ -2098,6 +2111,7 @@ NETWORK_UFW4 = Path('/etc/ufw/before.rules')
 NETWORK_UFW6 = Path('/etc/ufw/before6.rules')
 NETWORK_UFW_DEFAULT = Path('/etc/default/ufw')
 NETWORK_UFW_SYSCTL = Path('/etc/ufw/sysctl.conf')
+NETWORK_DNS_CURRENT = object()
 
 
 def network_paths(manager):
@@ -2352,8 +2366,10 @@ def network_insert_table(text, table, tag, rules):
     return ''.join(lines)
 
 
-def network_rules(manager, state):
+def network_rules(manager, state, dns_policy=NETWORK_DNS_CURRENT):
     interface, subnet = manager.interface, str(manager.address.network)
+    if dns_policy is NETWORK_DNS_CURRENT:
+        dns_policy = dns_state(manager) if 'dns_state' in globals() else None
     rules = []
     for policy in sorted(state['access'].values(), key=lambda p: p['address']):
         ip = policy['address']
@@ -2369,18 +2385,26 @@ def network_rules(manager, state):
         rules += ['-A ufw-before-input -i ' + interface + ' -s ' + ip + ' -j DROP',
                   '-A ufw-before-forward -i ' + interface + ' -s ' + ip + ' -j DROP',
                   '-A ufw-before-forward -o ' + interface + ' -d ' + ip + ' -j DROP']
+    # Existing account restrictions take precedence; DNS never grants an ACL exception.
+    if dns_policy is not None:
+        resolver = str(ipaddress.IPv4Address(dns_policy['address']))
+        if resolver != str(manager.address.ip):
+            fail('Private DNS must listen on this interface server address.')
+        for protocol in ('udp', 'tcp'):
+            rules.append('-A ufw-before-input -i ' + interface + ' -s ' + subnet
+                         + ' -d ' + resolver + '/32 -p ' + protocol + ' --dport 53 -j ACCEPT')
     if state['mode'] == 'full':
         rules += ['-A ufw-before-forward -i ' + interface + ' -o ' + state['egress'] + ' -s ' + subnet + ' -j ACCEPT',
                   '-A ufw-before-forward -i ' + state['egress'] + ' -o ' + interface + ' -d ' + subnet + ' -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT']
     nat = ['-A POSTROUTING -s ' + subnet + ' -o ' + state['egress'] + ' -j MASQUERADE'] if state['mode'] == 'full' else []
     ipv6 = ['-A ufw6-before-input -i ' + interface + ' -j DROP',
             '-A ufw6-before-forward -i ' + interface + ' -j DROP',
-            '-A ufw6-before-forward -o ' + interface + ' -j DROP'] if rules else []
+            '-A ufw6-before-forward -o ' + interface + ' -j DROP'] if state['access'] or state['mode'] == 'full' else []
     return rules, nat, ipv6
 
 
-def network_render(manager, state, before4, before6):
-    rules, nat, ipv6 = network_rules(manager, state)
+def network_render(manager, state, before4, before6, dns_policy=NETWORK_DNS_CURRENT):
+    rules, nat, ipv6 = network_rules(manager, state, dns_policy)
     tag = 'awg-network-' + manager.interface
     before4 = network_insert_table(before4, 'filter', tag + '-filter', rules)
     before4 = network_insert_table(before4, 'nat', tag + '-nat', nat)
@@ -2474,8 +2498,8 @@ def network_preflight(manager, state):
                 fail('Choose DNS resolvers reachable through the selected public egress.')
 
 
-def network_verify_rules(manager, state):
-    rules, nat, ipv6 = network_rules(manager, state)
+def network_verify_rules(manager, state, dns_policy=NETWORK_DNS_CURRENT):
+    rules, nat, ipv6 = network_rules(manager, state, dns_policy)
     for command, table, entries in [('iptables', 'filter', rules), ('iptables', 'nat', nat),
                                      ('ip6tables', 'filter', ipv6)]:
         for line in entries:
@@ -2484,16 +2508,24 @@ def network_verify_rules(manager, state):
         fail('IPv4 forwarding did not remain enabled after firewall reload.')
 
 
-def network_apply(manager, state, profile_changes=None, preview=False, confirm_action=True, removing=False, force=False):
+def network_apply(manager, state, profile_changes=None, preview=False, confirm_action=True, removing=False, force=False,
+                  dns_policy=NETWORK_DNS_CURRENT, apply_service=None, rollback_service=None, before_service=None,
+                  expected_originals=None):
     profile_changes = profile_changes or {}
+    # Use one reviewed policy throughout the transaction, including after its file changes.
+    if dns_policy is NETWORK_DNS_CURRENT:
+        dns_policy = copy.deepcopy(dns_state(manager)) if 'dns_state' in globals() else None
     if manager.runtime:
         manager.require_active()
     path, sysctl_path = network_paths(manager)
     originals = {p: network_snapshot(p, p == path or p in profile_changes)
                  for p in [NETWORK_UFW4, NETWORK_UFW6, path, sysctl_path, *profile_changes]}
+    for p, expected in (expected_originals or {}).items():
+        if p not in originals or originals[p] != expected:
+            fail('A reviewed file changed before the network transaction; retained.')
     if originals[NETWORK_UFW4] is None or originals[NETWORK_UFW6] is None:
         fail('Both UFW before-rules files must already exist.')
-    before4, before6 = network_render(manager, state, originals[NETWORK_UFW4][0], originals[NETWORK_UFW6][0])
+    before4, before6 = network_render(manager, state, originals[NETWORK_UFW4][0], originals[NETWORK_UFW6][0], dns_policy)
     sysctl_text = '# Managed AWG Internet forwarding: ' + manager.interface + '\nnet.ipv4.ip_forward=1\n'
     if originals[sysctl_path] is not None and originals[sysctl_path][0] != sysctl_text:
         fail('The expected owned forwarding file contains other settings; retained.')
@@ -2501,7 +2533,7 @@ def network_apply(manager, state, profile_changes=None, preview=False, confirm_a
                NETWORK_UFW6: (before6, originals[NETWORK_UFW6][1]),
                path: None if removing else (network_text(state), 0o600),
                sysctl_path: (sysctl_text, 0o644) if state['mode'] == 'full' else None}
-    changes.update({p: (text, 0o600) for p, text in profile_changes.items()})
+    changes.update({p: None if text is None else (text, 0o600) for p, text in profile_changes.items()})
     changes = {p: value for p, value in changes.items() if originals[p] != value}
     print('Network mode: ' + state['mode'] + '; access-controlled accounts: ' + str(len(state['access'])))
     print('Files to change: ' + str(len(changes)) + '. Stored profiles need re-export and client re-import.')
@@ -2536,7 +2568,11 @@ def network_apply(manager, state, profile_changes=None, preview=False, confirm_a
         manifest.append(record)
     atomic_write(backup / 'manifest.json', json.dumps({'files': manifest, 'ip_forward': forwarding}, indent=2) + '\n')
     touched = []
+    service_attempted = False
     try:
+        if before_service is not None:
+            service_attempted = True
+            before_service()
         for p, value in changes.items():
             touched.append(p)
             network_write(p, value, originals[p])
@@ -2544,7 +2580,10 @@ def network_apply(manager, state, profile_changes=None, preview=False, confirm_a
         if state['mode'] == 'full':
             run('sysctl', '-w', 'net.ipv4.ip_forward=1')
         network_firewall_order()
-        network_verify_rules(manager, state)
+        network_verify_rules(manager, state, dns_policy)
+        if apply_service is not None:
+            service_attempted = True
+            apply_service()
         for p, value in changes.items():
             if network_snapshot(p) != value:
                 fail('Network post-write verification failed.')
@@ -2563,6 +2602,14 @@ def network_apply(manager, state, profile_changes=None, preview=False, confirm_a
             run('ufw', 'reload')
         except BaseException:
             errors.append('network rollback')
+        if service_attempted and rollback_service is not None:
+            if errors:
+                errors.append('service rollback skipped because restored files or firewall need review')
+            else:
+                try:
+                    rollback_service()
+                except BaseException:
+                    errors.append('service rollback')
         if errors:
             print('Rollback needs review: ' + ', '.join(errors) + '; private snapshot: ' + str(backup), file=sys.stderr)
         raise
@@ -2571,6 +2618,7 @@ def network_apply(manager, state, profile_changes=None, preview=False, confirm_a
 def network_configure(manager, mode=None, egress=None, dns=None, preview=False):
     state = network_state(manager)
     old = copy.deepcopy(state)
+    private_dns = copy.deepcopy(dns_state(manager)) if 'dns_state' in globals() else None
     if mode is None:
         mode = prompt('Traffic mode (split/full) [' + state['mode'] + ']: ').strip() or state['mode']
     if mode not in ('split', 'full'):
@@ -2585,6 +2633,8 @@ def network_configure(manager, mode=None, egress=None, dns=None, preview=False):
         state.update(mode='full', egress=egress, dns=network_dns(dns))
         for name, client in manager.clients.items():
             text = manager.files[client['path']]
+            if private_dns is not None:
+                text = dns_profile_base(manager, name, text, private_dns)
             if old['mode'] == 'split':
                 state['clients'][name] = dict(public=client['public'], **network_profile_fields(text))
             original = state['clients'].get(name)
@@ -2601,6 +2651,14 @@ def network_configure(manager, mode=None, egress=None, dns=None, preview=False):
                     fail('Original split profile fields are missing or belong to another client.')
                 changes[client['path']] = network_restore_fields(manager.files[client['path']], original)
         state.update(mode='split', egress=None, dns=[], clients={})
+    if private_dns is not None:
+        for name, client in manager.clients.items():
+            text = changes.get(client['path'])
+            if text is None:
+                text = dns_profile_base(manager, name, manager.files[client['path']], private_dns)
+            changes[client['path']] = dns_overlay_profile(manager, name, client['public'], text, private_dns)
+        changes[dns_path(manager)] = dns_text(private_dns)
+        print('Private DNS remains active. Full-mode DNS settings are retained for use after private DNS is disabled.')
     network_apply(manager, state, changes, preview=preview)
 
 
@@ -2626,7 +2684,7 @@ def network_set_access(manager, name, rules=None, preview=False):
             fail('Supply one to 64 rules, deny, or inherit.')
         rules = [] if rules == ['deny'] else sorted(set(network_rule(rule) for rule in rules))
         state['access'][name] = {'public': client['public'], 'address': str(client['address'].ip) + '/32', 'rules': rules}
-        print('Unlisted IPv4 destinations/ports are denied. DNS needs its own UDP/TCP 53 rule when restricted.')
+        print('Unlisted IPv4 destinations/ports are denied, including private DNS. Permit its server IPv4 /32 on UDP/TCP 53 explicitly when needed.')
         print('IPv6 forwarding is blocked for this managed tunnel while a network policy is active.')
     network_apply(manager, state, preview=preview)
 
@@ -2638,12 +2696,450 @@ def network_reapply(manager, preview=False, confirm_action=True):
 def network_remove(manager, preview=False, confirm_action=True):
     state = network_state(manager)
     state.update(mode='split', egress=None, dns=[], clients={}, access={})
-    network_apply(manager, state, preview=preview, confirm_action=confirm_action, removing=True)
+    network_apply(manager, state, preview=preview, confirm_action=confirm_action, removing=True, dns_policy=None)
+
+"""Per-interface private DNS; embedded after network management."""
+
+DNS_SYSTEMD = Path('/etc/systemd/system')
+DNS_BINARY = Path('/usr/sbin/dnsmasq')
+DNS_MAX_RECORDS = 100
+
+
+def dns_path(manager):
+    return manager.base / (manager.interface + '.dns.json')
+
+
+def dns_unit_name(interface):
+    return 'awg-dns-' + valid_name(interface) + '.service'
+
+
+def dns_owned_paths(interface, base=Path('/etc/amnezia/amneziawg')):
+    interface = valid_name(interface)
+    return (Path(base) / (interface + '.dns.json'),
+            Path(base) / (interface + '.dnsmasq.conf'), DNS_SYSTEMD / dns_unit_name(interface))
+
+
+def dns_domain(value):
+    if not isinstance(value, str):
+        fail('DNS names must be ASCII fully qualified names.')
+    name = value[:-1].lower() if value.endswith('.') else value.lower()
+    labels = name.split('.')
+    if (len(name) > 253 or len(labels) < 2 or not re.fullmatch(r'[a-z0-9.-]+', name)
+            or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in labels)
+            or labels[-1].isdigit()):
+        fail('Use a fully qualified ASCII DNS name, without wildcards, URLs, or spaces.')
+    return name
+
+
+def dns_ipv4(value):
+    if not isinstance(value, str):
+        fail('DNS addresses must be IPv4 strings.')
+    address = ipaddress.IPv4Address(value)
+    if address.is_unspecified or address.is_loopback or address.is_multicast or address.is_link_local or address.is_reserved:
+        fail('Choose a unicast IPv4 address, not loopback, link-local, multicast, or reserved space.')
+    return str(address)
+
+
+def dns_listener(manager, address):
+    address = dns_ipv4(address)
+    if address != str(manager.address.ip):
+        fail('Private DNS must listen on this AWG instance server IPv4 only.')
+    return address
+
+
+def dns_records(value):
+    if isinstance(value, str):
+        pairs = value.replace(',', ' ').split()
+        result = {}
+        for pair in pairs:
+            if pair.count('=') != 1:
+                fail('Enter DNS records as name=IPv4, separated by spaces or commas.')
+            name, address = pair.split('=')
+            name = dns_domain(name)
+            if name in result:
+                fail('Duplicate private DNS name.')
+            result[name] = dns_ipv4(address)
+    elif isinstance(value, dict):
+        result = {}
+        for name, address in value.items():
+            normalized = dns_domain(name)
+            if normalized != name or normalized in result:
+                fail('Saved private DNS names must be unique canonical lowercase names.')
+            result[name] = dns_ipv4(address)
+    else:
+        fail('Invalid private DNS records.')
+    if not 1 <= len(result) <= DNS_MAX_RECORDS:
+        fail('Choose one to ' + str(DNS_MAX_RECORDS) + ' private DNS records.')
+    return dict(sorted(result.items()))
+
+
+def dns_upstreams(values, address):
+    if isinstance(values, str):
+        values = values.replace(',', ' ').split()
+    if not isinstance(values, list) or not 1 <= len(values) <= 3:
+        fail('Choose one to three IPv4 upstream DNS resolvers.')
+    result = [dns_ipv4(value) for value in values]
+    if len(set(result)) != len(result) or address in result:
+        fail('Upstream DNS resolvers must be distinct and must not point back to this DNS listener.')
+    return result
+
+
+def dns_text(state):
+    return json.dumps(state, indent=2, sort_keys=True) + '\n'
+
+
+def dns_check_route(text, address):
+    config = parse_config(text)
+    if len(config['peers']) != 1 or not any(ipaddress.IPv4Address(address) in route
+            for route in addresses(config['peers'][0], 'AllowedIPs') if route.version == 4):
+        fail('A stored client does not route the server DNS IPv4 through its AWG peer; fix its AllowedIPs first.')
+
+
+def dns_validate_state(manager, state):
+    if (not isinstance(state, dict) or set(state) != {'version', 'server_public', 'address', 'upstreams', 'records', 'clients'}
+            or type(state['version']) is not int or state['version'] != 1
+            or state['server_public'] != manager.server_public or state['address'] != str(manager.address.ip)
+            or not isinstance(state['clients'], dict)):
+        fail('Invalid private DNS metadata or server identity.')
+    dns_listener(manager, state['address'])
+    if state['records'] != dns_records(state['records']) or state['upstreams'] != dns_upstreams(state['upstreams'], state['address']):
+        fail('Saved private DNS policy is not canonical.')
+    if set(state['clients']) != set(manager.clients):
+        fail('Private DNS metadata and stored client inventory differ.')
+    for name, record in state['clients'].items():
+        valid_client_name(name)
+        client = manager.clients[name]
+        if (not isinstance(record, dict) or set(record) != {'public', 'dns'} or record['public'] != client['public']
+                or (record['dns'] is not None and (not isinstance(record['dns'], str)
+                    or any(ord(c) < 32 or ord(c) == 127 for c in record['dns']) or len(record['dns']) > 2048))):
+            fail('Invalid saved client DNS baseline or identity.')
+        profile = manager.files[client['path']]
+        if field(parse_config(profile)['interface'], 'DNS', None) != state['address']:
+            fail('A stored client no longer uses its managed DNS address; review external edits first.')
+        dns_check_route(profile, state['address'])
+    return state
+
+
+def dns_state(manager):
+    path = dns_path(manager)
+    if not exists(path):
+        return None
+    text = read_profile(path)
+    if len(text) > 256 * 1024:
+        fail('Private DNS metadata exceeds the size limit.')
+    state = json.loads(text)
+    dns_validate_state(manager, state)
+    previous = manager.files.get(path)
+    if previous is not None and previous != text:
+        fail('Private DNS metadata changed during management.')
+    manager.files[path] = text
+    for owned, expected in [(dns_owned_paths(manager.interface, manager.base)[1], dns_render(manager, state)),
+                            (dns_owned_paths(manager.interface, manager.base)[2], dns_unit(manager))]:
+        current = read_profile(owned)
+        if current != expected:
+            fail('Owned private DNS service/configuration differs from its saved policy; retained.')
+        if owned in manager.files and manager.files[owned] != current:
+            fail('Private DNS service/configuration changed during management.')
+        manager.files[owned] = current
+    return state
+
+
+def dns_profile_base(manager, name, text, state=None):
+    state = dns_state(manager) if state is None else state
+    if state is None:
+        return text
+    record = state['clients'].get(name)
+    if not record or record['public'] != manager.clients[name]['public']:
+        fail('Missing original DNS baseline for this client.')
+    return network_field(text, 'interface', 'DNS', record['dns'])
+
+
+def dns_overlay_profile(manager, name, public, text, state):
+    dns_check_route(text, state['address'])
+    state['clients'][name] = {'public': public, 'dns': field(parse_config(text)['interface'], 'DNS', None)}
+    return network_field(text, 'interface', 'DNS', state['address'])
+
+
+def dns_new_client(manager, name, public, text, pending_changes):
+    state = dns_state(manager)
+    if state is None:
+        return text
+    text = dns_overlay_profile(manager, name, public, text, state)
+    pending_changes[dns_path(manager)] = dns_text(state)
+    return text
+
+
+def dns_remove_client(manager, name, pending_changes):
+    state = dns_state(manager)
+    if state is not None:
+        state['clients'].pop(name)
+        pending_changes[dns_path(manager)] = dns_text(state)
+
+
+def dns_render(manager, state):
+    dns_listener(manager, state['address'])
+    text = ('# Managed private AWG DNS: ' + manager.interface + '\n'
+            'port=53\nbind-dynamic\n'
+            'listen-address=' + state['address'] + '\nno-hosts\nno-resolv\nno-poll\n'
+            'user=nobody\ngroup=nogroup\ncache-size=256\nlocal-ttl=0\nlog-facility=-\n')
+    text += ''.join('server=' + address + '\n' for address in state['upstreams'])
+    for name, address in state['records'].items():
+        # Keep AAAA/HTTPS and subordinate queries inside the private zone, not public DNS.
+        text += 'host-record=' + name + ',' + address + '\nlocal=/' + name + '/\n'
+    return text
+
+
+def dns_unit(manager):
+    config = dns_owned_paths(manager.interface, manager.base)[1]
+    awg = 'awg-quick@' + manager.interface + '.service'
+    return ('# Managed private AWG DNS: ' + manager.interface + '\n'
+            '[Unit]\nDescription=Private DNS for AWG ' + manager.interface + '\n'
+            'Requires=' + awg + '\nAfter=' + awg + '\nPartOf=' + awg + '\nBindsTo=' + awg + '\n'
+            '[Service]\nType=simple\nExecStart=' + str(DNS_BINARY) + ' --keep-in-foreground --conf-file='
+            + json.dumps(str(config)) + ' --pid-file=\nRestart=on-failure\nRestartSec=2\n'
+            'NoNewPrivileges=yes\nPrivateTmp=yes\nProtectHome=yes\nProtectSystem=strict\n'
+            'ProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\n'
+            'StandardOutput=null\nStandardError=null\n'
+            '[Install]\nWantedBy=' + awg + ' multi-user.target\n')
+
+
+def dns_validate(manager):
+    state = dns_state(manager)
+    paths = dns_owned_paths(manager.interface, manager.base)
+    if state is None:
+        if any(exists(p) for p in paths[1:]):
+            fail('Private DNS service/configuration exists without owned metadata; retained for review.')
+        return None
+    for path, expected in [(paths[1], dns_render(manager, state)), (paths[2], dns_unit(manager))]:
+        current = network_snapshot(path, private=True)
+        if current != (expected, 0o600):
+            fail('Owned private DNS service/configuration differs from its saved policy; retained.')
+    return state
+
+
+def dns_command(*args, required=True):
+    result = subprocess.run(args, text=True, capture_output=True, timeout=60,
+                            env={**os.environ, 'LC_ALL': 'C'})
+    if required and result.returncode:
+        fail('Private DNS command failed; command output suppressed: ' + str(args[0]))
+    return result
+
+
+def dns_service_state(interface):
+    unit = dns_unit_name(interface)
+    active = dns_command('systemctl', 'is-active', unit, required=False).stdout.strip()
+    enabled = dns_command('systemctl', 'is-enabled', unit, required=False).stdout.strip()
+    if active not in ('active', 'inactive', 'failed', 'unknown') or enabled not in ('enabled', 'disabled', 'not-found'):
+        fail('Unexpected private DNS service state; existing services were retained.')
+    return active, enabled
+
+
+def dns_service_apply(manager, enabled):
+    unit = dns_unit_name(manager.interface)
+    dns_command('systemctl', 'daemon-reload')
+    if enabled:
+        dns_command('systemctl', 'enable', unit)
+        # Restore stages DNS while AWG is stopped; its Wants dependency starts DNS later.
+        if manager.runtime:
+            dns_command('systemctl', 'restart', unit)
+            dns_verify_listener(manager)
+    else:
+        dns_command('systemctl', 'stop', unit, required=False)
+        dns_command('systemctl', 'disable', unit, required=False)
+        active, enabled_state = dns_service_state(manager.interface)
+        if active == 'active' or enabled_state == 'enabled':
+            fail('The private DNS service did not stop and disable.')
+
+
+
+def dns_verify_listener(manager):
+    # Type=simple can report active before dnsmasq has bound its sockets.
+    stable = 0
+    for attempt in range(5):
+        if dns_service_state(manager.interface) != ('active', 'enabled'):
+            fail('The private DNS service did not remain active and enabled.')
+        pid = dns_command('systemctl', 'show', '--property=MainPID', '--value', dns_unit_name(manager.interface)).stdout.strip()
+        output = dns_command('ss', '-H', '-lntup', 'sport = :53').stdout
+        protocols = set()
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) < 6 or parts[0] not in ('tcp', 'udp'):
+                fail('Unexpected DNS socket inventory after startup.')
+            pids = set(re.findall(r'pid=(\d+)', line))
+            if pid.isdecimal() and int(pid) > 0 and pid in pids:
+                address = parts[4].rsplit(':', 1)[0].strip('[]').split('%', 1)[0]
+                if pids != {pid} or address != str(manager.address.ip):
+                    fail('Private DNS opened an unexpected listener; rolling back.')
+                protocols.add(parts[0])
+        stable = stable + 1 if protocols == {'tcp', 'udp'} else 0
+        if stable >= 2:
+            return
+        if attempt < 4:
+            time.sleep(0.2)
+    fail('Private DNS TCP and UDP listeners were not verified on the intended tunnel IPv4.')
+
+
+def dns_service_restore(manager, old):
+    unit = dns_unit_name(manager.interface)
+    dns_command('systemctl', 'daemon-reload')
+    if old[1] == 'enabled':
+        dns_command('systemctl', 'enable', unit)
+    else:
+        dns_command('systemctl', 'disable', unit, required=False)
+    if old[0] == 'active':
+        dns_command('systemctl', 'restart', unit)
+    else:
+        dns_command('systemctl', 'stop', unit, required=False)
+    active, enabled = dns_service_state(manager.interface)
+    if (active == 'active') != (old[0] == 'active') or (enabled == 'enabled') != (old[1] == 'enabled'):
+        fail('Private DNS service rollback needs manual review.')
+
+
+def dns_stop(manager, disable=True):
+    if dns_validate(manager) is None:
+        return
+    dns_command('systemctl', 'stop', dns_unit_name(manager.interface))
+    if disable:
+        dns_command('systemctl', 'disable', dns_unit_name(manager.interface))
+    active, enabled = dns_service_state(manager.interface)
+    if active == 'active' or (disable and enabled == 'enabled'):
+        fail('Private DNS stop/disable verification failed.')
+
+
+def dns_ports_available(manager, old):
+    own_pid = None
+    if old and dns_service_state(manager.interface)[0] == 'active':
+        value = dns_command('systemctl', 'show', '--property=MainPID', '--value', dns_unit_name(manager.interface)).stdout.strip()
+        if value.isdecimal() and int(value) > 0:
+            own_pid = value
+    output = dns_command('ss', '-H', '-lntup', 'sport = :53').stdout
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 6 or parts[0] not in ('tcp', 'udp'):
+            fail('Unexpected DNS socket inventory; review port 53 before setup.')
+        address = parts[4].rsplit(':', 1)[0].strip('[]')
+        if address in ('*', '0.0.0.0', '::', str(manager.address.ip)):
+            pids = set(re.findall(r'pid=(\d+)', line))
+            if not own_pid or pids != {own_pid}:
+                fail('Port 53 conflicts with another listener; existing DNS services were retained.')
+
+
+def dns_binary_install():
+    if not DNS_BINARY.is_file():
+        # dnsmasq-base supplies the binary without enabling the global dnsmasq service.
+        dns_command('apt-get', 'update')
+        result = subprocess.run(['apt-get', 'install', '-y', '--no-install-recommends', 'dnsmasq-base'],
+                                text=True, capture_output=True, timeout=300,
+                                env={**os.environ, 'LC_ALL': 'C', 'DEBIAN_FRONTEND': 'noninteractive'})
+        if result.returncode or not DNS_BINARY.is_file():
+            fail('dnsmasq-base installation failed; any installed packages remain. No global DNS service was requested.')
+
+
+def dns_check_config(manager, state):
+    with tempfile.TemporaryDirectory(prefix=manager.interface + '-dns-check-', dir=manager.base) as directory:
+        path = Path(directory) / 'dnsmasq.conf'
+        atomic_write(path, dns_render(manager, state))
+        dns_command(str(DNS_BINARY), '--test', '--conf-file=' + str(path))
+
+
+def dns_show(manager):
+    state = dns_validate(manager)
+    if state is None:
+        print('Private DNS: disabled for ' + manager.interface)
+        return
+    print('Private DNS: ' + state['address'] + ':53 on ' + manager.interface)
+    print('Upstream resolvers: ' + ', '.join(state['upstreams']))
+    for index, (name, address) in enumerate(state['records'].items(), 1):
+        print(str(index) + ') ' + name + ' = ' + address)
+    print('Connected clients use this DNS for all system DNS queries, not only private names.')
+
+
+def dns_change(manager, state, *, preview=False, confirm_action=True):
+    old = dns_validate(manager)
+    paths = dns_owned_paths(manager.interface, manager.base)
+    owned_originals = {p: network_snapshot(p, private=True) for p in paths}
+    profiles = {}
+    if state is not None:
+        state = copy.deepcopy(state)
+        for name, client in manager.clients.items():
+            text = manager.files[client['path']]
+            if old:
+                text = dns_profile_base(manager, name, text, old)
+            profiles[client['path']] = dns_overlay_profile(manager, name, client['public'], text, state)
+        profiles.update({paths[0]: dns_text(state), paths[1]: dns_render(manager, state), paths[2]: dns_unit(manager)})
+    else:
+        if old is None:
+            print('Private DNS is already disabled.')
+            return
+        profiles.update({client['path']: dns_profile_base(manager, name, manager.files[client['path']], old)
+                         for name, client in manager.clients.items()})
+        profiles.update({p: None for p in paths})
+    print('Private DNS ' + ('enable/update' if state else 'disable') + ': ' + manager.interface)
+    if state:
+        print('All system DNS queries use the tunnel DNS while connected; unrelated names are forwarded upstream.')
+        print('Private records also prevent public DNS fallback for those names and their subdomains.')
+        print('VPC routes and destination permissions are separate: configure VPC access before opening private services.')
+        print('Restricted accounts need explicit UDP and TCP 53 permission to ' + state['address'] + '/32 in Client access permissions.')
+    print('When client DNS settings change, re-export and re-import the affected profiles; imported profiles are not updated remotely.')
+    print('Record-only updates keep client profiles unchanged; cached DNS answers may take time to expire.')
+    policy = network_state(manager)
+    if preview:
+        network_apply(manager, policy, profiles, preview=True, dns_policy=state, expected_originals=owned_originals)
+        return
+    service = dns_service_state(manager.interface)
+    if old is None and (service[0] == 'active' or service[1] != 'not-found'):
+        fail('A same-named DNS service already exists without owned metadata; retained.')
+    if confirm_action:
+        confirm('Apply this private DNS change? Public DNS records, server resolv.conf, hosts and unrelated services stay unchanged.\n'
+                'If needed, dnsmasq-base and its dependencies will be installed and retained on later failure.\n'
+                'DNS outages may affect all domain resolution on connected clients.')
+    manager.unchanged()
+    if state:
+        dns_ports_available(manager, old)
+        for address in state['upstreams']:
+            local = {a.get('local') for entry in manager.local for a in entry.get('addr_info', [])}
+            routes = json.loads(run('ip', '-j', '-4', 'route', 'get', address))
+            if address in local or not routes or routes[0].get('dev') == manager.interface or routes[0].get('type') in ('local', 'blackhole', 'unreachable', 'prohibit'):
+                fail('Upstream DNS must be reachable outside this AWG interface and must not be a local address.')
+        dns_binary_install()
+        dns_check_config(manager, state)
+        dns_ports_available(manager, old)
+    network_apply(manager, policy, profiles, confirm_action=False, dns_policy=state, force=True,
+                  before_service=(lambda: dns_stop(manager, disable=True)) if state is None else None,
+                  expected_originals=owned_originals,
+                  apply_service=lambda: dns_service_apply(manager, state is not None),
+                  rollback_service=lambda: dns_service_restore(manager, service))
+    print('Private DNS settings saved. Real client DNS, VPC reachability and reboot behavior still require verification.')
+
+
+def dns_configure(manager, preview=False):
+    manager.require_active()
+    old = dns_validate(manager)
+    current_records = ' '.join(name + '=' + ip for name, ip in (old['records'].items() if old else []))
+    records = prompt('Private DNS records (name=IPv4, separated by spaces)' + (' [' + current_records + ']' if old else '') + ': ').strip() or current_records
+    current_upstreams = ', '.join(old['upstreams'] if old else ['1.1.1.1', '9.9.9.9'])
+    upstreams = prompt('Upstream IPv4 DNS resolvers [' + current_upstreams + ']: ').strip() or current_upstreams
+    state = {'version': 1, 'server_public': manager.server_public, 'address': str(manager.address.ip),
+             'upstreams': dns_upstreams(upstreams, str(manager.address.ip)), 'records': dns_records(records), 'clients': {}}
+    dns_change(manager, state, preview=preview)
+
+
+def dns_disable(manager, preview=False, confirm_action=True):
+    dns_change(manager, None, preview=preview, confirm_action=confirm_action)
+
+
+def dns_reapply(manager, preview=False, confirm_action=True):
+    state = dns_validate(manager)
+    if state is not None:
+        if not preview and not DNS_BINARY.is_file():
+            fail('Install dnsmasq-base before restoring/reapplying private DNS; this operation does not install packages.')
+        dns_change(manager, state, preview=preview, confirm_action=confirm_action)
 
 """Private local operations; embedded after the account manager by the packager."""
 import fcntl as ops_fcntl
 import hashlib as ops_hashlib
 import shutil as ops_shutil
+from types import SimpleNamespace as OpsNamespace
 
 OPS_BASE = Path('/etc/amnezia/amneziawg')
 OPS_SYSTEMD = Path('/etc/systemd/system')
@@ -2720,6 +3216,10 @@ def ops_atomic(path, text, expected=None):
         if exists(Path(temporary)):
             os.unlink(temporary)
 
+def ops_dns_paths(interface):
+    return set(dns_owned_paths(interface, base=OPS_BASE)) if 'dns_owned_paths' in globals() else set()
+
+
 def ops_allowed(interface, path):
     interface = valid_name(interface)
     path = Path(path)
@@ -2730,6 +3230,7 @@ def ops_allowed(interface, path):
               OPS_SYSTEMD / ('awg-expiry-' + interface + '.service'),
               OPS_SYSTEMD / ('awg-expiry-' + interface + '.timer'),
               OPS_SYSTEMD / ('awg-quick@' + interface + '.service.d') / '90-awg-expiry.conf'}
+    fixed.update(ops_dns_paths(interface))
     if path in fixed:
         return True
     return (path.parent == OPS_BASE / 'clients' / interface and path.suffix == '.conf'
@@ -2759,6 +3260,9 @@ def ops_owned_paths(manager):
         paths.update(path for path in network_owned_paths(manager.interface, base=OPS_BASE) if exists(path))
     if 'lifecycle_owned_paths' in globals():
         paths.update(lifecycle_owned_paths(manager.interface))
+    if 'dns_validate' in globals():
+        dns_validate(manager)
+        paths.update(path for path in ops_dns_paths(manager.interface) if exists(path))
     for path in paths:
         if not ops_allowed(manager.interface, path):
             fail('An owned path falls outside the selected interface allowlist.')
@@ -2963,6 +3467,50 @@ def ops_backup(interface, destination=None, announce=True):
     return destination
 
 
+def dns_restore_preflight(interface, contents, base):
+    """Validate DNS snapshot data and executable unit text before touching services."""
+    if 'dns_owned_paths' not in globals():
+        return
+    owned = set(dns_owned_paths(interface, base=base))
+    present = owned.intersection(contents)
+    if not present:
+        return
+    if present != owned:
+        fail('Private DNS snapshot is incomplete; configuration was retained.')
+    if any(contents[path][1] != 0o600 for path in owned):
+        fail('Private DNS snapshot files must have private permissions.')
+    if base / (interface + '.network.json') not in contents:
+        fail('Private DNS snapshot lacks its managed firewall policy.')
+    server_path = base / (interface + '.conf')
+    config = parse_config(contents[server_path][0])
+    address = [value for value in addresses(config['interface'], 'Address', interface=True) if value.version == 4]
+    if len(address) != 1:
+        fail('Private DNS restore requires one server IPv4 address.')
+    server_public = key(run('awg', 'pubkey', data=key(field(config['interface'], 'PrivateKey')) + '\n'))
+    profiles = {}
+    initial_paths = {base / (interface + '-client.conf'), base / 'clients' / (interface + '.conf')}
+    for path, (text, mode) in contents.items():
+        if path in initial_paths:
+            name = 'initial'
+        elif path.parent == base / 'clients' / interface and path.suffix == '.conf':
+            name = valid_client_name(path.stem)
+        else:
+            continue
+        if name in profiles:
+            fail('Private DNS snapshot contains duplicate client identities.')
+        profile = parse_config(text)
+        if len(profile['peers']) != 1 or key(field(profile['peers'][0], 'PublicKey')) != server_public:
+            fail('Private DNS snapshot client belongs to a different server.')
+        public = key(run('awg', 'pubkey', data=key(field(profile['interface'], 'PrivateKey')) + '\n'))
+        profiles[name] = {'path': path, 'public': public}
+    candidate = OpsNamespace(interface=interface, base=base, address=address[0], server_public=server_public,
+                             clients=profiles, files={path: value[0] for path, value in contents.items()})
+    state = dns_validate_state(candidate, json.loads(contents[dns_path(candidate)][0]))
+    _, config_path, unit_path = dns_owned_paths(interface, base=base)
+    if contents[config_path][0] != dns_render(candidate, state) or contents[unit_path][0] != dns_unit(candidate):
+        fail('Private DNS snapshot service/configuration differs from its validated policy.')
+
+
 def ops_load_backup(interface, directory):
     interface = valid_name(interface)
     directory = secure_path(Path(directory))
@@ -2997,7 +3545,7 @@ def ops_load_backup(interface, directory):
         text, _ = ops_read(directory / blob)
         if ops_hashlib.sha256(text.encode()).hexdigest() != record['sha256']:
             fail('Snapshot integrity check failed.')
-        if path.suffix == '.conf' and OPS_BASE in path.parents:
+        if path.suffix == '.conf' and OPS_BASE in path.parents and path not in ops_dns_paths(interface):
             config = parse_config(text)
             if any(name in config['interface']['fields'] for name in ('PreUp', 'PostUp', 'PreDown', 'PostDown', 'SaveConfig')):
                 fail('Automatic restore requires profiles without shell hooks or SaveConfig.')
@@ -3022,9 +3570,11 @@ def ops_load_backup(interface, directory):
                     fail('Network sysctl snapshot lacks its network policy.')
             elif not manifest['vpc'] or manifest['vpc']['sysctl'] != str(path):
                 fail('Legacy sysctl snapshot lacks matching VPC ownership.')
-        if OPS_SYSTEMD in path.parents or OPS_LIBEXEC in path.parents:
+        if (OPS_SYSTEMD in path.parents or OPS_LIBEXEC in path.parents) and path not in ops_dns_paths(interface):
             if not text.startswith('# Managed by AWG account expiry: ' + interface + '\n'):
                 fail('Expiry snapshot ownership marker is absent.')
+    if 'dns_restore_preflight' in globals():
+        dns_restore_preflight(interface, contents, base=OPS_BASE)
     return manifest, contents
 
 
@@ -3095,6 +3645,8 @@ def ops_reapply(interface, manager):
     ops_command('systemctl', 'daemon-reload')
     if 'lifecycle_reapply' in globals():
         lifecycle_reapply(interface, confirm_action=False)
+    if 'dns_reapply' in globals():
+        dns_reapply(manager, confirm_action=False)
 
 
 def ops_start_guard(interface):
@@ -3135,6 +3687,9 @@ def ops_set_unit(interface, state):
             raise OpsHandoffChanged('Managed state changed during service-start handoff; changes were retained. Review the private rollback snapshot manually.')
         manager = ops_manager(interface)
         manager.require_active()
+        if 'dns_state' in globals() and dns_state(manager) is not None:
+            if ops_command('systemctl', 'is-active', dns_unit_name(interface), required=False).stdout.strip() != 'active':
+                raise OpsHandoffChanged('The restored private DNS service is not active; retain current files and review the rollback snapshot.')
         if ops_command('systemctl', 'is-active', unit, required=False).stdout.strip() != 'active':
             raise OpsHandoffChanged('Selected service did not start after lock handoff; current files were retained for review.')
     except OpsHandoffChanged:
@@ -3160,6 +3715,8 @@ def ops_assert_absent(interface):
 
 
 def ops_stop_checked(interface, has_profile=True):
+    if has_profile and 'dns_stop' in globals():
+        dns_stop(ops_manager(interface), disable=True)
     ops_command('systemctl', 'stop', 'awg-quick@' + interface + '.service')
     if has_profile:
         if ops_manager(interface).runtime is not None:
@@ -3176,7 +3733,7 @@ def ops_note_removed(owned, expected, paths):
 
 def ops_network_expectation(manager):
     path = OPS_BASE / (manager.interface + '.network.json')
-    if not exists(path):
+    if not exists(path) and not ('dns_state' in globals() and dns_state(manager) is not None):
         return None
     before = {p: ops_current(p) for p in (NETWORK_UFW4, NETWORK_UFW6)}
     if any(value is None for value in before.values()):
@@ -3192,6 +3749,8 @@ def ops_cleanup_restore_hooks(interface, owned, originals, network_expected, vpc
     for path, expected in owned.items():
         if ops_current(path) not in (expected, originals.get(path)):
             fail('Concurrent restore edits require manual policy cleanup.')
+    if 'dns_stop' in globals() and exists(OPS_BASE / (interface + '.conf')):
+        dns_stop(ops_manager(interface), disable=True)
     if network_expected:
         before, after = network_expected
         current = {path: ops_current(path) for path in before}
@@ -3213,12 +3772,24 @@ def ops_cleanup_restore_hooks(interface, owned, originals, network_expected, vpc
             if not exists(path):
                 owned[path] = None
 
+def ops_dns_restore_guard(interface, old, contents):
+    if not ops_dns_paths(interface).intersection(contents):
+        return
+    if 'DNS_BINARY' in globals() and not DNS_BINARY.is_file():
+        fail('Install dnsmasq-base before restoring a private DNS snapshot; no services were changed.')
+    if old is None or dns_validate(old) is None:
+        active, enabled = dns_service_state(interface)
+        if active not in ('inactive', 'unknown') or enabled != 'not-found':
+            fail('A same-named unowned DNS service exists; no services or files were changed.')
+
+
 def ops_restore(interface, backup, preview=False):
     interface = valid_name(interface)
     manifest, contents = ops_load_backup(interface, backup)
     old = ops_manager(interface) if exists(OPS_BASE / (interface + '.conf')) else None
     if old:
         ops_check_unit_owner(interface, old)
+    ops_dns_restore_guard(interface, old, contents)
     old_vpc = ops_vpc(old) if old else None
     if old_vpc:
         saved_server = parse_config(contents[OPS_BASE / (interface + '.conf')][0])
@@ -3228,7 +3799,7 @@ def ops_restore(interface, backup, preview=False):
     if old is None:
         ops_assert_absent(interface)
         leftovers = lifecycle_owned_paths(interface) if 'lifecycle_owned_paths' in globals() else []
-        if leftovers or exists(OPS_BASE / (interface + '.network.json')):
+        if leftovers or exists(OPS_BASE / (interface + '.network.json')) or any(exists(path) for path in ops_dns_paths(interface)):
             fail('Orphaned management resources require review before restoring a removed instance.')
     current_paths = ops_owned_paths(old) if old else []
     changes = {p: None for p in current_paths if p not in contents}
@@ -3403,6 +3974,14 @@ def ops_doctor(interface):
         manager = ops_manager(interface)
         manager.unchanged()
         print('Saved profile pairing: validated; stored clients: ' + str(len(manager.clients)))
+        if 'dns_validate' in globals():
+            dns = dns_validate(manager)
+            if dns is None:
+                print('Private DNS: not configured')
+            else:
+                service = ops_command('systemctl', 'is-active', dns_unit_name(interface), required=False).stdout.strip()
+                service = service if service in ('active', 'inactive', 'failed') else 'unknown'
+                print('Private DNS: configuration validated; service=' + service + '; records=' + str(len(dns['records'])))
         if manager.runtime:
             peers = manager.runtime['peers']
             timestamps = [p.get('handshake', 0) for p in peers.values()]
@@ -3489,7 +4068,8 @@ def admin_dispatch(arguments):
     legacy = {'--list-clients', '--add-client', '--export-client', '--remove-client', '--set-port'}
     if operation in legacy:
         return _admin_original_dispatch(arguments)
-    if operation in {'--restore', '--uninstall', '--configure-network', '--set-access'}:
+    if operation in {'--restore', '--uninstall', '--configure-network', '--set-access',
+                     '--configure-dns', '--disable-dns'}:
         values, preview = admin_preview(values)
     else:
         preview = False
@@ -3500,6 +4080,8 @@ def admin_dispatch(arguments):
         '--set-expiry': (2, 2), '--enforce-expiry': (0, 0),
         '--configure-network': (0, 1), '--set-access': (1, 65),
         '--assert-vpc-compatible': (0, 0),
+        '--check-server': (0, 0), '--check-empty-server': (0, 0),
+        '--show-dns': (0, 0), '--configure-dns': (0, 0), '--disable-dns': (0, 0),
     }
     if operation not in counts or not counts[operation][0] <= len(values) <= counts[operation][1]:
         fail('Invalid management arguments; see --help for command forms.')
@@ -3529,6 +4111,24 @@ def admin_dispatch(arguments):
         return network_set_access(Manager(interface), values[0],
                                   rules=values[1:] or None, preview=preview)
     manager = Manager(interface)
+    if operation == '--show-dns':
+        return dns_show(manager)
+    if operation == '--configure-dns':
+        return dns_configure(manager, preview=preview)
+    if operation == '--disable-dns':
+        return dns_disable(manager, preview=preview)
+    if operation in {'--check-server', '--check-empty-server'}:
+        manager.require_active()
+        _, mtu = manager.profile_settings()
+        if operation == '--check-empty-server':
+            if manager.metadata is None or manager.clients or manager.disk_peers or manager.runtime['peers']:
+                fail('New installation requires server metadata and zero client peers.')
+            live_mtu = next(entry.get('mtu') for entry in manager.local if entry.get('ifname') == interface)
+            if type(live_mtu) is not int or live_mtu != mtu or manager.metadata['mtu'] != live_mtu:
+                fail('Saved management MTU and running tunnel MTU differ.')
+        manager.unchanged()
+        print('Saved server and runtime configuration validated; client connectivity was not tested.')
+        return
     if operation == '--disable-client':
         return manager.disable_client(values[0])
     if operation == '--enable-client':
@@ -3563,6 +4163,21 @@ def admin_choose_client(interface):
         print('Choose an account number from 1 to ' + str(len(names)) + ', or 0 to go back.')
 
 
+def admin_dns_menu(interface):
+    while True:
+        print('\nPrivate DNS (dnsmasq): ' + interface + '\n'
+              '1) Show DNS settings\n2) Configure private DNS\n'
+              '3) Disable private DNS\n0) Back')
+        choice = prompt('Select: ')
+        if choice == '0':
+            return
+        operations = {'1': '--show-dns', '2': '--configure-dns', '3': '--disable-dns'}
+        if choice in operations:
+            admin_dispatch([operations[choice], interface])
+        else:
+            print('Choose a menu number from 0 to 3.')
+
+
 def main(arguments=None):
     arguments = sys.argv[1:] if arguments is None else list(arguments)
     if os.geteuid() != 0 or sys.platform != 'linux':
@@ -3578,7 +4193,8 @@ def main(arguments=None):
               '7) Split / full traffic mode\n8) Client access permissions\n'
               '9) Disable client\n10) Enable client\n11) Client expiry\n'
               '12) Redacted diagnostics\n13) Private backup\n14) Restore backup\n'
-              '15) Export client QR (terminal or PNG)\n16) Uninstall this interface\n0) Exit')
+              '15) Export client QR (terminal or PNG)\n16) Uninstall this interface\n'
+              '17) Private DNS (dnsmasq)\n0) Exit')
         choice = prompt('Select: ')
         if choice == '0':
             return 0
@@ -3615,8 +4231,10 @@ def main(arguments=None):
         elif choice == '16':
             admin_dispatch(['--uninstall', interface])
             return 0
+        elif choice == '17':
+            admin_dns_menu(interface)
         else:
-            print('Choose a menu number from 0 to 16.')
+            print('Choose a menu number from 0 to 17.')
 
 
 if __name__ == '__main__':
@@ -4200,7 +4818,8 @@ def collect_clients(server_public, peers, interface, accounts=None):
         found[path] = (text, mode)
     if set(accounts) - accounted:
         fail('Account metadata references a missing stored profile.')
-    if not found:
+    # A fresh server may store route policy before its first named client is added.
+    if not found and peers:
         fail('No matching stored client profiles were found; export them on this server before configuring VPC routes.')
     return found
 
@@ -5126,6 +5745,9 @@ main() {
         say '       sudo bash setup-manage-amneziawg.sh --set-expiry INTERFACE NAME UTC_TIMESTAMP_OR_none'
         say '       sudo bash setup-manage-amneziawg.sh --enforce-expiry INTERFACE'
         say '       sudo bash setup-manage-amneziawg.sh --configure-network INTERFACE [split|full] [--preview]'
+        say '       sudo bash setup-manage-amneziawg.sh --show-dns INTERFACE'
+        say '       sudo bash setup-manage-amneziawg.sh --configure-dns INTERFACE [--preview]'
+        say '       sudo bash setup-manage-amneziawg.sh --disable-dns INTERFACE [--preview]'
         say '       sudo bash setup-manage-amneziawg.sh --set-access INTERFACE NAME [RULE ...|inherit|deny] [--preview]'
         say '       sudo bash setup-manage-amneziawg.sh --backup INTERFACE [/ABSOLUTE/NEW_DIRECTORY]'
         say '       sudo bash setup-manage-amneziawg.sh --restore INTERFACE /ABSOLUTE/BACKUP_DIRECTORY [--preview]'
@@ -5136,10 +5758,12 @@ main() {
         say 'Installs AmneziaWG, creates one client with a PSK, and adds one public UDP rule to active UFW.'
         say 'PSK update preserves existing keys and networking, backs up profiles, and updates only the selected peer.'
         say 'Check mode reads profiles and live state without printing secrets or changing configuration.'
-        say 'Initial installation uses split routing. Optional full traffic mode is offered after setup and in the management menu.'
+        say 'New installation creates only the server, with no default client. Add named clients in management; split/full routing remains configurable.'
         say 'VPC wizard: choose the existing AWG interface, private VPC exit, target, and SNAT address; review before APPLY.'
         say 'VPC changes update stored client routes. Re-export/re-import distributed profiles; cloud firewalls remain unchanged.'
         say 'Full mode provides IPv4 Internet egress, explicit DNS, and tunneled IPv6 blocking; it is not dual-stack Internet or a client kill switch.'
+        say 'Private DNS is optional per instance: named IPv4 records plus upstream forwarding. Connected clients send system DNS queries through the tunnel, not only private names.'
+        say 'DNS changes require profile re-export/re-import. VPC routes, destination ACLs, HTTPS certificates, and Passkey RP/origin settings remain separate.'
         say 'Access RULE: IPv4CIDR:tcp:PORT, IPv4CIDR:udp:PORT, IPv4CIDR:icmp, or IPv4CIDR:any. ACLs run on the gateway.'
         say 'Expiry uses UTC and a systemd timer. QR export requires an existing qrencode command; QR images contain private keys.'
         say 'Omit the export path (or leave it blank in the menu) to display the profile or QR in the terminal after APPLY. Session recordings may capture secrets.'
@@ -5169,7 +5793,7 @@ main() {
             configure_vpc "$@"
             return
             ;;
-        --manage|--add-client|--list-clients|--export-client|--remove-client|--set-port|--doctor|--backup|--restore|--uninstall|--export-qr|--disable-client|--enable-client|--set-expiry|--enforce-expiry|--configure-network|--set-access|--assert-vpc-compatible)
+        --manage|--add-client|--list-clients|--export-client|--remove-client|--set-port|--doctor|--backup|--restore|--uninstall|--export-qr|--disable-client|--enable-client|--set-expiry|--enforce-expiry|--configure-network|--set-access|--assert-vpc-compatible|--check-server|--check-empty-server|--show-dns|--configure-dns|--disable-dns)
             (( $# >= 2 )) || die 'Supply the AmneziaWG interface; use --help for command forms.'
             [[ $2 =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]] || die 'Invalid AmneziaWG interface name.'
             (( EUID == 0 )) || die 'Run with sudo or as root.'
@@ -5211,6 +5835,13 @@ main() {
             command -v "$command_name" >/dev/null || die "Required command missing: $command_name"
         done
         check_awg_version
+        if [[ $mode == --check && $# == 2 &&
+              ! -e /etc/amnezia/amneziawg/clients/$interface.conf && ! -L /etc/amnezia/amneziawg/clients/$interface.conf &&
+              ! -e /etc/amnezia/amneziawg/$interface-client.conf && ! -L /etc/amnezia/amneziawg/$interface-client.conf ]]; then
+            acquire_lock
+            manage_clients --check-server "$interface"
+            return
+        fi
         if [[ -z $client ]]; then
             if [[ -e /etc/amnezia/amneziawg/clients/$interface.conf && -e /etc/amnezia/amneziawg/$interface-client.conf ]]; then
                 die 'Both new and legacy client profiles exist. Supply the intended CLIENT_PROFILE explicitly.'
@@ -5255,24 +5886,22 @@ main() {
     if [[ ! $AWG_PORT =~ ^[1-9][0-9]{0,4}$ ]] || (( AWG_PORT > 65535 )); then die 'Invalid UDP port.'; fi
     ip -j -4 route show table all > "$WORK/routes.json"
     ip -j -4 address show dev "$PUBLIC_IF" > "$WORK/addresses.json"
-    python3 - "$SERVER_ADDRESS" "$CLIENT_ADDRESS" "$PUBLIC_IP" "$WORK/routes.json" "$WORK/addresses.json" <<'PY'
+    python3 - "$SERVER_ADDRESS" "$PUBLIC_IP" "$WORK/routes.json" "$WORK/addresses.json" <<'PY'
 import ipaddress, json, sys
-server, client = map(ipaddress.IPv4Interface, sys.argv[1:3])
-public = ipaddress.IPv4Address(sys.argv[3])
+server = ipaddress.IPv4Interface(sys.argv[1])
+public = ipaddress.IPv4Address(sys.argv[2])
 network = server.network
-if not (network.is_private and client.network.prefixlen == 32
-        and client.ip in network and server.ip != client.ip
+if not (network.is_private and network.prefixlen <= 30
         and server.ip not in (network.network_address, network.broadcast_address)
-        and client.ip not in (network.network_address, network.broadcast_address)
         and public not in network):
     raise SystemExit('Invalid VPN addresses.')
-for route in json.load(open(sys.argv[4])):
+for route in json.load(open(sys.argv[3])):
     destination = route.get('dst', 'default')
     if destination == 'default': continue
     existing = ipaddress.IPv4Network(destination, strict=False)
     if existing.prefixlen and network.overlaps(existing):
         raise SystemExit('VPN subnet overlaps an existing server route: ' + destination)
-addresses = [a['local'] for i in json.load(open(sys.argv[5])) for a in i.get('addr_info', [])]
+addresses = [a['local'] for i in json.load(open(sys.argv[4])) for a in i.get('addr_info', [])]
 if str(public) not in addresses:
     raise SystemExit('Public IP is not assigned to the selected interface.')
 PY
@@ -5286,11 +5915,11 @@ PY
     fi
     [[ ! -e /etc/wireguard/$AWG_IF.conf && ! -L /etc/wireguard/$AWG_IF.conf ]] || die 'An existing native WireGuard configuration uses this interface name; it was retained.'
     AWG_FILE="/etc/amnezia/amneziawg/$AWG_IF.conf"
-    # Keep the exported tunnel name within AmneziaWG's 15-character limit.
-    CLIENT_FILE="/etc/amnezia/amneziawg/clients/$AWG_IF.conf"
+    CLIENT_DIR="/etc/amnezia/amneziawg/clients/$AWG_IF"
+    METADATA_FILE="$CLIENT_DIR/metadata.json"
     [[ ! -L /etc/amnezia && ! -L /etc/amnezia/amneziawg && ! -L /etc/amnezia/amneziawg/clients ]] || die 'AmneziaWG directories must not be symbolic links.'
     prepare_awg_directories check
-    for path in "$AWG_FILE" "$CLIENT_FILE"; do
+    for path in "$AWG_FILE" "$CLIENT_DIR" "/etc/amnezia/amneziawg/clients/$AWG_IF.conf" "/etc/amnezia/amneziawg/$AWG_IF-client.conf"; do
         [[ ! -e $path && ! -L $path ]] || die "Existing configuration retained: $path"
     done
     ufw status | grep -qx 'Status: active' || die 'UFW must already be active; this script does not reset or enable it.'
@@ -5299,8 +5928,8 @@ PY
         die 'A UFW rule already mentions this UDP port. Review the existing rule before continuing.'
     fi
     say "AmneziaWG endpoint: $PUBLIC_IP:$AWG_PORT/udp on $PUBLIC_IF"
-    say "Server: $SERVER_ADDRESS; client: $CLIENT_ADDRESS; interface: $AWG_IF"
-    say "MTU: $AWG_MTU (auto omits the field; a number is written to both profiles)."
+    say "Server: $SERVER_ADDRESS; interface: $AWG_IF; initial clients: 0"
+    say "MTU: $AWG_MTU (auto selects the server tunnel MTU; future clients inherit it)."
     say 'Only AmneziaWG configuration and one UDP allow rule will be added. Existing services and other rules stay in place.'
     say 'Check that the proposed VPN subnet does not overlap the client LAN or another VPN.'
     say 'This is a new native AmneziaWG 3.1 interface, not a migration of an existing WireGuard or Amnezia Docker deployment.'
@@ -5313,13 +5942,14 @@ PY
     ensure_awg_tools
     # Package installation may have created directories; recheck trust and initialize only empty private ones.
     prepare_awg_directories create
-    for path in "$AWG_FILE" "$CLIENT_FILE"; do
+    for path in "$AWG_FILE" "$CLIENT_DIR" "/etc/amnezia/amneziawg/clients/$AWG_IF.conf" "/etc/amnezia/amneziawg/$AWG_IF-client.conf"; do
         [[ ! -e $path && ! -L $path ]] || die "A configuration appeared during package installation and was retained: $path"
     done
+    mkdir -m 700 -- "$CLIENT_DIR"
+    CLIENT_DIR_CREATED=1
     write_profiles
     FILES_CREATED=1
     install -m 600 "$WORK/server.conf" "$AWG_FILE"
-    install -m 600 "$WORK/client.conf" "$CLIENT_FILE"
     UFW_RULE=(allow in on "$PUBLIC_IF" proto udp to "$PUBLIC_IP" port "$AWG_PORT" comment 'manage-awg-udp')
     RULE_ADDED=1
     ufw "${UFW_RULE[@]}"
@@ -5327,18 +5957,18 @@ PY
     systemctl enable --now "awg-quick@$AWG_IF"
     systemctl is-active --quiet "awg-quick@$AWG_IF"
     ip link show dev "$AWG_IF" >/dev/null
-    # Read back the full 3.1 device parameters, shared HPK, and PSK; the legacy peer flag is not a 3.1 capability check.
-    update_psk "$AWG_IF" "$CLIENT_FILE" --check >/dev/null
+    write_server_metadata
+    # Read back full 3.1 parameters and the server identity before accepting a peer-free installation.
+    manage_clients --check-empty-server "$AWG_IF" >/dev/null
     SUCCESS=1
     say ''
-    say 'Server interface configured and enabled at boot; client handshake is NOT yet verified.'
-    say "Client profile: $CLIENT_FILE (contains a private key, PSK, and shared header-protection key; transfer securely)."
-    say 'Import into an AmneziaWG 3.1-compatible client; do not use the standard WireGuard client.'
-    say 'Import this complete profile into the client. Disable the old profile for this server before activating the new one.'
+    say 'Server interface configured and enabled at boot. No client account or profile was created.'
+    say "Add a named client from management option 1: sudo bash $0 --manage $AWG_IF"
+    say 'Use an AmneziaWG 3.1-compatible client for profiles you export after adding an account.'
     say "If a Vultr Firewall is attached, also allow inbound UDP $AWG_PORT there."
-    say "After activating the client, check the handshake with: awg show $AWG_IF"
-    say "Read-only profile and runtime check: sudo bash $0 --check $AWG_IF"
-    say "Only ${SERVER_ADDRESS%/*}/32 is routed through this VPN. Access to services follows the existing server firewall."
+    say "After adding and activating a client, check its handshake with: awg show $AWG_IF"
+    say "Read-only server check: sudo bash $0 --check $AWG_IF"
+    say "New clients initially route only ${SERVER_ADDRESS%/*}/32 unless a different network policy is configured."
     say 'Existing public service access remains unchanged. Client handshake and reboot behavior still require verification.'
     say ''
     say 'Optional traffic mode: 1) Keep split routing (default); 2) Configure full Internet traffic.'

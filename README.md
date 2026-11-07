@@ -32,11 +32,12 @@ Shortcut installation requires a stable, root-owned script location and trusted 
 
 ## Features
 
-- Guided native AmneziaWG installation and custom UDP ports.
+- Guided server-only native AmneziaWG installation with six prompts and custom UDP ports; add named accounts afterward.
 - Per-device client profiles, names such as `alice.mac`, suspension/resumption and UTC account expiry.
 - Numbered account selection for existing-client operations, with VPN addresses and configured state.
 - Numbered VPC interface, target-scope and SNAT choices, plus split/full-tunnel IPv4 routing.
 - Gateway-enforced per-client destination and port permissions.
+- Optional per-instance dnsmasq with private domain records, upstream forwarding, and client DNS inheritance/restoration.
 - Terminal configuration/QR output or private file export, redacted diagnostics, backups, restore and scoped removal.
 - Confirmed script updates from stable GitHub Releases, with checksum validation, backups and downgrade protection.
 
@@ -48,6 +49,16 @@ sudo bash ./setup-wireguard.sh --manage awg-manage
 sudo bash ./setup-wireguard.sh --configure-network awg-manage full --preview
 sudo bash ./setup-wireguard.sh --doctor awg-manage
 ```
+
+## Server-only installation
+
+New installations create the server with **zero client accounts**. The six prompts
+cover public interface, endpoint IPv4, UDP port, AWG interface name, server VPN
+CIDR and MTU. No default client key, peer PSK, client profile or server peer is
+generated. After installation, select the instance and choose **1: Add client**
+to create a named account. Existing accounts, including legacy `initial` profiles,
+remain unchanged. VPC routes and DNS policy can be prepared before adding the first
+account. Automatic server MTU selection is recorded for later clients.
 
 ## Script updates
 **One-time upgrade for versions v2026-11-08-2 and v2026-11-08-3:** these versions have a terminal-confirmation bug in shortcut installation and script updates (`File or stream is not seekable`). Version v2026-11-08-4 fixes both prompts. Download and verify the fixed release, then manually replace the saved script once; the affected updater fails at its own confirmation prompt. Keep the same canonical path if using an existing command symlink. Replacing only the script preserves AWG accounts, keys and network settings.
@@ -75,18 +86,67 @@ sudo bash ./setup-wireguard.sh --export-client awg-manage alice.mac
 sudo bash ./setup-wireguard.sh --export-qr awg-manage alice.mac
 ```
 Client names start with an ASCII letter and accept up to 15 letters, digits, dots, underscores or hyphens. Interface naming rules are unchanged. Configuration text and QR codes contain credentials: terminal scrollback, output redirection and session recordings can retain them. Display them only in a trusted session. QR generation stays local and requires `qrencode`.
+## Private DNS
+
+Choose management option **17: Private DNS (dnsmasq)**, then show settings,
+configure private DNS, disable it, or return. The command-line equivalents are:
+
+```bash
+sudo bash ./setup-wireguard.sh --show-dns awg-manage
+sudo bash ./setup-wireguard.sh --configure-dns awg-manage --preview
+sudo bash ./setup-wireguard.sh --configure-dns awg-manage
+sudo bash ./setup-wireguard.sh --disable-dns awg-manage --preview
+sudo bash ./setup-wireguard.sh --disable-dns awg-manage
+```
+
+The wizard accepts named IPv4 records and upstream IPv4 resolver addresses. For
+example, a private record can map `manage.example.test` to a remote VPC host. The
+resolver listens on the selected AWG instance, using its actual server tunnel
+address, rather than assuming a particular `10.x.x.x` address. It uses a dedicated
+configuration and systemd service; DHCP, query logging, the server's global DNS,
+`/etc/hosts`, public DNS records, and unrelated DNS services remain unchanged.
+Existing port conflicts are reported rather than stopping another resolver.
+
+**This is centralized tunnel DNS, not client-side split DNS.** Compatible clients
+prefer this resolver for system DNS queries while connected; only the configured
+private names receive the local override, and other names are forwarded upstream.
+Applications with independent DNS/DoH settings may bypass the system resolver.
+An unavailable gateway resolver can affect other domain lookups. DNS selection
+does not itself turn split traffic routing into a full-tunnel VPN.
+
+Private DNS remains selected when switching between full and split traffic modes.
+While it is enabled, the full-mode wizard's resolver setting is retained as the
+baseline to restore if private DNS is disabled; change the active resolver's
+upstream servers through option **17** instead.
+
+Enabling DNS updates stored client profiles, including disabled accounts, and new
+accounts inherit the setting. Re-export and re-import profiles after enabling or
+disabling DNS; existing imported profiles do not receive pushed changes. Record
+updates alone do not require new profiles when their routes remain valid. A fresh
+server with no accounts can save DNS policy before its first named account is added.
+Disabling the service restores the saved client DNS settings; remove or replace old
+imported profiles at the same time so they do not keep querying a stopped resolver.
+
+DNS records do not create VPC routes or grant access to target services. Configure
+VPC access separately with option **6**, and allow the application ports as needed.
+Restricted accounts retain their ACLs: explicitly include both UDP and TCP port 53
+to the server tunnel IP if they need DNS. A `deny` account remains denied. HTTPS
+still needs a certificate matching the browser hostname and trusted by the client;
+existing Passkeys require the original RP ID and allowed Origin settings.
+
 ## Requirements and important notes
 
 - Ubuntu with root access, systemd and active UFW. Installation offers its package changes for confirmation.
 - AmneziaWG 3.1-compatible tools, kernel support and clients. This is not a V2Ray node or a standard WireGuard client profile.
 - Distribution is a single `.sh` file, but it contains Python code and requires Python 3. Account expiry creates a private Python helper and systemd units.
+- Private DNS setup offers `dnsmasq-base` only when needed and confirmed; it retains shared packages on failure or removal. Updating the script alone does not enable DNS or change existing client profiles.
 - QR export requires an existing `qrencode` command. QR images, generated profiles and backups contain credentials; keep them private.
 - Full mode provides IPv4 Internet egress; IPv6 is routed into the tunnel and blocked. It is not dual-stack Internet or a device-wide kill switch. Re-export and re-import client profiles after routing or endpoint changes.
 - Cloud firewalls, Nginx and unrelated services remain under your control. Keep separate SSH or console access before network changes.
 - A restore changing the tunnel subnet while a legacy VPC policy is active stops before mutation; plan that migration separately.
 - Removing this script's forwarding configuration does not force the shared runtime IPv4-forwarding setting off, because another service may need it.
 
-The release artifact passed 427 offline development tests, including real pseudo-terminal confirmation regressions and a Gitleaks scan with no findings. The development tests are not included in this minimal distribution. Real Linux firewall behavior, systemd reboot ordering, QR decoding and client connectivity still require deployment acceptance testing.
+The release artifact passed 594 offline development tests, including real pseudo-terminal confirmation regressions and a Gitleaks scan with no findings. The development tests are not included in this minimal distribution. Real Linux firewall behavior, systemd reboot ordering, actual dnsmasq resolution, QR decoding and client connectivity still require deployment acceptance testing.
 
 ## Download statistics
 
