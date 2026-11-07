@@ -1,0 +1,21 @@
+# Generated credentials and deployment state
+*.conf
+*.key
+*.pem
+.env
+.env.*
+clients/
+backups/
+*backup*/
+# Diagnostics and exports
+*.log
+*.pcap
+*.pcapng
+*.png
+*.zip
+*.tar
+*.tar.gz
+# Local development files
+__pycache__/
+*.pyc
+.DS_Store
