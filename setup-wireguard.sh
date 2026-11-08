@@ -4,7 +4,7 @@ set +x
 set -Eeuo pipefail
 umask 077
 
-EASY_AWG_VERSION=v2026-11-08-5
+EASY_AWG_VERSION=v2026-11-08-6
 
 # Edit these defaults or supply environment variables when invoking the script.
 # The wizard shows each default and lets you replace it before installation.
@@ -2734,7 +2734,10 @@ def dns_domain(value):
 def dns_ipv4(value):
     if not isinstance(value, str):
         fail('DNS addresses must be IPv4 strings.')
-    address = ipaddress.IPv4Address(value)
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        fail('DNS addresses require four decimal octets, for example 1.1.1.1.')
     if address.is_unspecified or address.is_loopback or address.is_multicast or address.is_link_local or address.is_reserved:
         fail('Choose a unicast IPv4 address, not loopback, link-local, multicast, or reserved space.')
     return str(address)
@@ -3116,11 +3119,23 @@ def dns_configure(manager, preview=False):
     manager.require_active()
     old = dns_validate(manager)
     current_records = ' '.join(name + '=' + ip for name, ip in (old['records'].items() if old else []))
-    records = prompt('Private DNS records (name=IPv4, separated by spaces)' + (' [' + current_records + ']' if old else '') + ': ').strip() or current_records
+    while True:
+        value = prompt('Private DNS records (name=IPv4, separated by spaces)' + (' [' + current_records + ']' if old else '') + ': ').strip() or current_records
+        try:
+            records = dns_records(value)
+            break
+        except ValueError as error:
+            print('Invalid private DNS records: ' + str(error))
     current_upstreams = ', '.join(old['upstreams'] if old else ['1.1.1.1', '9.9.9.9'])
-    upstreams = prompt('Upstream IPv4 DNS resolvers [' + current_upstreams + ']: ').strip() or current_upstreams
+    while True:
+        value = prompt('Upstream IPv4 DNS resolvers [' + current_upstreams + ']: ').strip() or current_upstreams
+        try:
+            upstreams = dns_upstreams(value, str(manager.address.ip))
+            break
+        except ValueError as error:
+            print('Invalid upstream DNS resolvers: ' + str(error) + ' Press Enter to use the displayed defaults, or enter IPv4 addresses.')
     state = {'version': 1, 'server_public': manager.server_public, 'address': str(manager.address.ip),
-             'upstreams': dns_upstreams(upstreams, str(manager.address.ip)), 'records': dns_records(records), 'clients': {}}
+             'upstreams': upstreams, 'records': records, 'clients': {}}
     dns_change(manager, state, preview=preview)
 
 

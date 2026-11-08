@@ -99,7 +99,7 @@ sudo bash ./setup-wireguard.sh --disable-dns awg-manage --preview
 sudo bash ./setup-wireguard.sh --disable-dns awg-manage
 ```
 
-The wizard accepts named IPv4 records and upstream IPv4 resolver addresses. For
+The wizard accepts named IPv4 records and upstream IPv4 resolver addresses. Invalid records or upstream addresses now show a field-specific error and retry that field without exiting management. Previously valid records are retained. Press Enter to use the displayed defaults; a dash is invalid. Closing terminal input aborts before applying changes. For
 example, a private record can map `manage.example.test` to a remote VPC host. The
 resolver listens on the selected AWG instance, using its actual server tunnel
 address, rather than assuming a particular `10.x.x.x` address. It uses a dedicated
@@ -146,7 +146,7 @@ existing Passkeys require the original RP ID and allowed Origin settings.
 - A restore changing the tunnel subnet while a legacy VPC policy is active stops before mutation; plan that migration separately.
 - Removing this script's forwarding configuration does not force the shared runtime IPv4-forwarding setting off, because another service may need it.
 
-The release artifact passed 594 offline development tests, including real pseudo-terminal confirmation regressions and a Gitleaks scan with no findings. The development tests are not included in this minimal distribution. Real Linux firewall behavior, systemd reboot ordering, actual dnsmasq resolution, QR decoding and client connectivity still require deployment acceptance testing.
+The release artifact passed 602 offline development tests, including real pseudo-terminal confirmation regressions and a Gitleaks scan with no findings. The development tests are not included in this minimal distribution. Real Linux firewall behavior, systemd reboot ordering, actual dnsmasq resolution, QR decoding and client connectivity still require deployment acceptance testing.
 
 ## Download statistics
 
