@@ -20,18 +20,30 @@ Review the script before running it, then open the interactive menu:
 sudo bash ./setup-wireguard.sh
 ```
 
+On an interactive root Linux terminal, first launch offers script initialization before the main menu. Choose initialization or skip it; changes require `APPLY`.
+
 The main menu offers:
 
 - **1**: Install a new instance.
 - **2**: Select and manage an existing instance.
-- **3**: Install the optional `awg-manage` command shortcut.
+- **3**: Initialize the script installation and `awg-manage` command.
 - **4**: Check for a new Release and update this script.
 - **0**: Exit without changes.
 
-Shortcut installation requires a stable, root-owned script location and trusted parent directories. After confirmation it creates `/usr/local/bin/awg-manage` as a symbolic link, not a second copy. Existing different commands are retained. Keep the original script in place.
+## Script initialization
+
+Choose main-menu option **3**, accept the first-run offer, or run `sudo bash ./setup-wireguard.sh --initialize`.
+
+Choose an absolute installation directory; the default is `/usr/local/lib/easy-awg`. Review the plan and type `APPLY`. The script creates a root-owned mode-700 directory, installs the single `setup-wireguard.sh` with mode 700, and creates `/usr/local/bin/awg-manage` as a symlink. It verifies copied bytes and Bash syntax and durably writes the installation before removing an original under protected root-owned directories. Originals in user-owned/shared download locations are retained; the plan tells you which behavior applies. Failed installation retains the original and rolls back resources created by that attempt. Unrelated commands and different destination files are retained.
+
+After initialization, run `sudo awg-manage` or `sudo /usr/local/bin/awg-manage`; the old download path is no longer needed. Existing VPN profiles, accounts, keys, services and network policies stay unchanged. Initialization shares the installer/updater lock and releases it before reopening the installed menu. Explicit CLI operations do not initialize automatically.
+
+The previous `--install-command` link-only command remains available. It requires a trusted root-owned source location, adds owner execute permission if needed and links to the existing script without relocation. Keep the source in place when using that legacy command.
 
 ## Features
 
+- Confirmed first-run initialization into a private installation directory and a stable `awg-manage` command.
+- Read-only AWG health checks with separate PASS/WARN/FAIL/UNKNOWN/SKIP results.
 - Guided server-only native AmneziaWG installation with six prompts and custom UDP ports; add named accounts afterward.
 - Per-device client profiles, names such as `alice.mac`, suspension/resumption and UTC account expiry.
 - Numbered account selection for existing-client operations, with VPN addresses and configured state.
@@ -48,6 +60,7 @@ sudo bash ./setup-wireguard.sh --help
 sudo bash ./setup-wireguard.sh --manage awg-manage
 sudo bash ./setup-wireguard.sh --configure-network awg-manage full --preview
 sudo bash ./setup-wireguard.sh --doctor awg-manage
+sudo bash ./setup-wireguard.sh --health awg-manage
 ```
 
 ## Server-only installation
@@ -134,6 +147,18 @@ to the server tunnel IP if they need DNS. A `deny` account remains denied. HTTPS
 still needs a certificate matching the browser hostname and trusted by the client;
 existing Passkeys require the original RP ID and allowed Origin settings.
 
+## AWG health checks
+
+Choose instance-menu option **18: AWG health check**, or run `sudo awg-manage --health INTERFACE`.
+
+The read-only report checks service and boot state, interface, profile directory permissions, runtime UDP port/socket, peer handshake recency and cumulative transfer counters, saved/runtime consistency, forwarding and route policy, and optional private DNS service/listeners. Independent runtime checks continue even when saved configuration is invalid. No/stale handshakes warn rather than declaring an idle client broken; an empty peer list is skipped. CLI exit status is `1` for any FAIL, otherwise `2` for any UNKNOWN, otherwise `0`. Interactive checks return to the instance menu.
+
+These local checks do not verify effective NAT/ACL/UFW rules, cloud firewalls, client return paths, DNS answers, VPC application access or HTTPS. Full-traffic mode checks default egress rather than a separate VPC route. No configuration, service or firewall changes are made.
+
+### DNS settings permission correction
+
+This release fixes the DNS settings reader treating `/etc/systemd/system` as a private mode-700 directory. Normal trusted shared-directory permissions such as 755 are accepted for that owned unit path; **do not change the system directory to 700**. Private profiles still require mode-700 directories, and owned unit files still require root ownership, mode 600 and no symlink/hard-link aliases. The error was a management-read failure, not proof that running AWG or DNS had stopped.
+
 ## Requirements and important notes
 
 - Ubuntu with root access, systemd and active UFW. Installation offers its package changes for confirmation.
@@ -146,7 +171,7 @@ existing Passkeys require the original RP ID and allowed Origin settings.
 - A restore changing the tunnel subnet while a legacy VPC policy is active stops before mutation; plan that migration separately.
 - Removing this script's forwarding configuration does not force the shared runtime IPv4-forwarding setting off, because another service may need it.
 
-The release artifact passed 602 offline development tests, including real pseudo-terminal confirmation regressions and a Gitleaks scan with no findings. The development tests are not included in this minimal distribution. Real Linux firewall behavior, systemd reboot ordering, actual dnsmasq resolution, QR decoding and client connectivity still require deployment acceptance testing.
+The release artifact passed 703 offline development tests, including real pseudo-terminal confirmation regressions and a Gitleaks scan with no findings. The development tests are not included in this minimal distribution. Real Linux firewall behavior, systemd reboot ordering, actual dnsmasq resolution, QR decoding and client connectivity still require deployment acceptance testing.
 
 ## Download statistics
 

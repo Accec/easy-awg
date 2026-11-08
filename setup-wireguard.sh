@@ -4,7 +4,7 @@ set +x
 set -Eeuo pipefail
 umask 077
 
-EASY_AWG_VERSION=v2026-11-08-6
+EASY_AWG_VERSION=v2026-11-08-7
 
 # Edit these defaults or supply environment variables when invoking the script.
 # The wizard shows each default and lets you replace it before installation.
@@ -948,8 +948,8 @@ def peer_security(text):
     return result
 
 
-def read_profile(path):
-    path = secure_path(path, private_parent=True)
+def read_profile(path, *, private_parent=True):
+    path = secure_path(path, private_parent=private_parent)
     with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'r', newline='') as stream:
         info = os.fstat(stream.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
@@ -2836,9 +2836,11 @@ def dns_state(manager):
     if previous is not None and previous != text:
         fail('Private DNS metadata changed during management.')
     manager.files[path] = text
-    for owned, expected in [(dns_owned_paths(manager.interface, manager.base)[1], dns_render(manager, state)),
-                            (dns_owned_paths(manager.interface, manager.base)[2], dns_unit(manager))]:
-        current = read_profile(owned)
+    _, config_path, unit_path = dns_owned_paths(manager.interface, manager.base)
+    for owned, expected in [(config_path, dns_render(manager, state)),
+                            (unit_path, dns_unit(manager))]:
+        # The shared systemd directory is normally 0755; its owned unit stays private.
+        current = read_profile(owned, private_parent=False) if owned == unit_path else read_profile(owned)
         if current != expected:
             fail('Owned private DNS service/configuration differs from its saved policy; retained.')
         if owned in manager.files and manager.files[owned] != current:
@@ -4018,6 +4020,217 @@ def ops_doctor(interface):
     print('These are local observations, not an end-to-end health check. Cloud firewall, return path, client DNS, and client browsing remain unverified.')
 
 
+def ops_health(interface):
+    """Read-only local checks; private command output is never printed."""
+    interface = valid_name(interface)
+    results = []
+    errors = (OSError, ValueError, TypeError, KeyError, IndexError, subprocess.SubprocessError)
+
+    def report(label, status, message):
+        results.append(status)
+        print('[' + status + '] ' + label + ': ' + message)
+
+    def read(*args, codes=(0,)):
+        result = ops_command(*args, required=False)
+        if result.returncode not in codes or len(result.stdout.encode()) > OPS_LIMIT:
+            raise OSError('Inspection failed')
+        return result.stdout.strip()
+
+    def check(label, probe):
+        try:
+            status, message = probe()
+            report(label, status, message)
+        except errors:
+            report(label, 'UNKNOWN', 'inspection unavailable or response not understood; private details suppressed.')
+
+    def service(unit):
+        value = read('systemctl', 'is-active', unit, codes=(0, 3, 4))
+        if value == 'active':
+            return 'PASS', 'active' + (' (active/exited is normal for awg-quick).' if unit.startswith('awg-quick@') else '.')
+        if value in ('inactive', 'failed', 'unknown'):
+            return 'FAIL', 'not active.'
+        return 'UNKNOWN', 'service is transitioning or returned an unexpected state.'
+
+    def boot(unit=None):
+        value = read('systemctl', 'is-enabled', unit or 'awg-quick@' + interface + '.service', codes=(0, 1, 4))
+        if value == 'enabled':
+            return 'PASS', 'enabled at boot.'
+        if value in ('disabled', 'static', 'indirect', 'enabled-runtime', 'masked', 'masked-runtime', 'not-found'):
+            return 'WARN', 'not persistently enabled; review reboot behavior.'
+        return 'UNKNOWN', 'boot enablement not established.'
+
+    def link():
+        rows = json.loads(read('ip', '-j', 'link', 'show'))
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError('Unexpected link inventory')
+        matches = [row for row in rows if row.get('ifname') == interface]
+        if not matches:
+            return 'FAIL', 'interface is absent.'
+        if len(matches) != 1 or not isinstance(matches[0].get('flags'), list):
+            raise ValueError('Unexpected link state')
+        return ('PASS', 'administratively UP; operstate UNKNOWN is valid for a tunnel.') if 'UP' in matches[0]['flags'] else ('FAIL', 'interface is administratively down.')
+
+    print('AWG health check: ' + interface + ' (read-only local observations)')
+    check('AWG service', lambda: service('awg-quick@' + interface + '.service'))
+    check('Boot enablement', boot)
+    check('Tunnel interface', link)
+    for directory in (OPS_BASE, OPS_BASE / 'clients', OPS_BASE / 'clients' / interface):
+        def permissions(path=directory):
+            if not exists(path):
+                return ('FAIL' if path == OPS_BASE else 'SKIP'), str(path) + ' is absent.'
+            info = path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                return 'FAIL', str(path) + ' needs trusted root ownership and mode 700; no permissions were changed.'
+            return 'PASS', str(path) + ' has private directory permissions.'
+        check('Profile directory', permissions)
+
+    runtime_present = None
+    port = None
+    try:
+        runtime_present = interface in read('awg', 'show', 'interfaces').split()
+        report('AWG runtime', 'PASS' if runtime_present else 'FAIL', 'interface registered with AWG.' if runtime_present else 'interface is not registered with AWG.')
+        if runtime_present:
+            port = valid_port(read('awg', 'show', interface, 'listen-port'))
+            report('Listen port', 'PASS', str(port) + '/udp configured in AWG.')
+    except errors:
+        report('AWG runtime / port', 'UNKNOWN', 'inspection unavailable; private details suppressed.')
+    if port is not None:
+        def udp_listener():
+            rows = [line.split() for line in read('ss', '-H', '-l', '-u', '-n', 'sport', '=', ':' + str(port)).splitlines()]
+            if any(len(row) < 5 or row[3].rsplit(':', 1)[-1] != str(port) for row in rows):
+                raise ValueError('Unexpected UDP inventory')
+            return ('PASS', 'local UDP socket observed; remote reachability is unverified.') if rows else ('FAIL', 'configured UDP socket not observed.')
+        check('UDP listener', udp_listener)
+    else:
+        report('UDP listener', 'SKIP', 'no validated runtime port.')
+
+    peers = None
+    if runtime_present:
+        def handshakes():
+            nonlocal peers
+            parsed = {}
+            for line in read('awg', 'show', interface, 'latest-handshakes').splitlines():
+                row = line.split()
+                if len(row) != 2 or not row[1].isdecimal() or row[0] in parsed:
+                    raise ValueError('Unexpected handshake inventory')
+                parsed[key(row[0])] = int(row[1])
+            peers = parsed
+            if not peers:
+                return 'SKIP', 'zero runtime peers; add or enable an account before client testing.'
+            now = int(time.time())
+            future = sum(value > now for value in peers.values())
+            if future:
+                return 'UNKNOWN', 'future handshake timestamps observed; check system time.'
+            recent = sum(0 < value and now - value <= 180 for value in peers.values())
+            never = sum(value == 0 for value in peers.values())
+            stale = len(peers) - recent - never
+            status = 'PASS' if recent == len(peers) else 'WARN'
+            return status, 'peers=' + str(len(peers)) + ', recent (<=180s)=' + str(recent) + ', older=' + str(stale) + ', never=' + str(never) + '; idle clients may have old handshakes, not proof of failure.'
+        check('Peer handshakes', handshakes)
+        def transfer():
+            counters = {}
+            for line in read('awg', 'show', interface, 'transfer').splitlines():
+                row = line.split()
+                if len(row) != 3 or not all(value.isdecimal() for value in row[1:]) or row[0] in counters:
+                    raise ValueError('Unexpected transfer inventory')
+                counters[key(row[0])] = (int(row[1]), int(row[2]))
+            if peers is None or set(counters) != set(peers):
+                return 'UNKNOWN', 'peer inventory changed or was not validated; rerun the check.'
+            if not counters:
+                return 'SKIP', 'zero runtime peers.'
+            return 'PASS', 'received=' + str(sum(v[0] for v in counters.values())) + ', sent=' + str(sum(v[1] for v in counters.values())) + ' bytes; cumulative counters reset on runtime recreation, not a traffic-rate test.'
+        check('Transfer counters', transfer)
+    else:
+        report('Peer handshakes / transfer', 'SKIP', 'AWG runtime was not observed.')
+
+    manager = None
+    try:
+        manager = ops_manager(interface)
+        report('Saved profiles', 'PASS', 'validated; stored accounts=' + str(len(manager.clients)) + '.')
+        if manager.runtime:
+            if field(manager.server['interface'], 'SaveConfig').lower() == 'true':
+                report('Saved/runtime pairing', 'UNKNOWN', 'SaveConfig=true prevents complete management validation; connectivity is not classified as failed.')
+            else:
+                try:
+                    manager.require_active()
+                    report('Saved/runtime pairing', 'PASS', 'addresses, listen ports and managed peers match.')
+                except errors:
+                    report('Saved/runtime pairing', 'FAIL', 'saved and live state did not pass validation; private details suppressed.')
+        else:
+            report('Saved/runtime pairing', 'SKIP', 'saved profiles only; runtime inactive.')
+    except errors:
+        report('Saved profiles', 'UNKNOWN', 'validation failed or inspection unavailable; check profile ownership/modes and saved/runtime consistency. Runtime checks above remain independent.')
+
+    if manager is not None:
+        try:
+            policy = network_state(manager)
+            vpc = ops_vpc(manager)
+            report('Routing policy', 'PASS', policy['mode'] + ' policy validated; owned VPC policy ' + ('present.' if vpc else 'absent.'))
+            if policy['mode'] == 'full' or vpc:
+                def forwarding():
+                    value = read('sysctl', '-n', 'net.ipv4.ip_forward')
+                    if value not in ('0', '1'):
+                        raise ValueError('Unexpected forwarding state')
+                    return ('PASS', 'IPv4 forwarding enabled.') if value == '1' else ('FAIL', 'IPv4 forwarding disabled for configured routed access.')
+                check('IPv4 forwarding', forwarding)
+                egress = policy['egress'] if policy['mode'] == 'full' else vpc['rule'][vpc['rule'].index('out') + 2]
+                def route_check():
+                    if policy['mode'] == 'full':
+                        routes = json.loads(read('ip', '-j', '-4', 'route', 'show', 'default'))
+                    else:
+                        target = ipaddress.IPv4Network(vpc['rule'][vpc['rule'].index('to') + 1])
+                        local = {ipaddress.IPv4Address(item['local']) for entry in getattr(manager, 'local', [])
+                                 for item in entry.get('addr_info', []) if item.get('family', 'inet') == 'inet'}
+                        destination = next((address for address in target.hosts() if address not in local), None)
+                        if destination is None:
+                            return 'WARN', 'VPC target contains only local addresses; remote egress is not applicable.'
+                        routes = json.loads(read('ip', '-j', '-4', 'route', 'get', str(destination)))
+                    if not isinstance(routes, list) or any(not isinstance(row, dict) for row in routes):
+                        raise ValueError('Unexpected routes')
+                    found = any(row.get('dev') == egress and row.get('type', 'unicast') == 'unicast' for row in routes)
+                    return ('PASS', 'expected egress route observed; target reachability unverified.') if found else ('FAIL', 'expected egress route not observed.')
+                check('Configured egress route', route_check)
+            else:
+                report('IPv4 forwarding / egress', 'SKIP', 'no full-tunnel or owned VPC forwarding policy.')
+        except errors:
+            report('Routing policy', 'UNKNOWN', 'policy or firewall inspection not validated; no network changes made.')
+        try:
+            dns = dns_validate(manager)
+            if dns is None:
+                report('Private DNS', 'SKIP', 'not configured.')
+            else:
+                report('Private DNS configuration', 'PASS', 'owned policy and files validated; records=' + str(len(dns['records'])) + '.')
+                check('Private DNS service', lambda: service(dns_unit_name(interface)))
+                check('Private DNS boot enablement', lambda: boot(dns_unit_name(interface)))
+                def dns_listener():
+                    pid = read('systemctl', 'show', '--property=MainPID', '--value', dns_unit_name(interface))
+                    if not pid.isdecimal() or int(pid) == 0:
+                        return 'FAIL', 'no running resolver process.'
+                    protocols = set()
+                    for line in read('ss', '-H', '-lntup', 'sport = :53').splitlines():
+                        parts = line.split()
+                        if len(parts) < 6 or parts[0] not in ('tcp', 'udp'):
+                            raise ValueError('Unexpected DNS listener inventory')
+                        owners = set(re.findall(r'pid=(\d+)', line))
+                        address = parts[4].rsplit(':', 1)[0].strip('[]').split('%', 1)[0]
+                        if pid in owners:
+                            if owners != {pid} or address != dns['address']:
+                                return 'FAIL', 'resolver owns an unexpected listener.'
+                            protocols.add(parts[0])
+                        elif address == dns['address'] and not owners:
+                            return 'UNKNOWN', 'DNS socket owner not visible.'
+                    return ('PASS', 'owned TCP and UDP sockets on the tunnel IPv4; answers untested.') if protocols == {'tcp', 'udp'} else ('FAIL', 'owned TCP/UDP DNS listeners missing.')
+                check('Private DNS listeners', dns_listener)
+        except errors:
+            report('Private DNS', 'UNKNOWN', 'configuration inspection not validated; details suppressed.')
+    else:
+        report('Routing policy / private DNS', 'UNKNOWN', 'saved configuration was not validated.')
+    result = 1 if 'FAIL' in results else 2 if 'UNKNOWN' in results else 0
+    print('Summary: ' + ', '.join(status + '=' + str(results.count(status)) for status in ('PASS', 'WARN', 'FAIL', 'UNKNOWN', 'SKIP')) + '; exit=' + str(result) + '.')
+    print('Local checks only: effective NAT/ACL/UFW rules, cloud firewall, client return path, DNS answers, VPC application access and HTTPS remain unverified. Full-traffic mode checks the default egress, not a separate VPC route. Nothing was changed.')
+    return result
+
+
 def ops_export_qr(interface, name, destination=None):
     manager = ops_manager(interface)
     client = manager.selected(name)
@@ -4089,7 +4302,7 @@ def admin_dispatch(arguments):
     else:
         preview = False
     counts = {
-        '--doctor': (0, 0), '--backup': (0, 1), '--restore': (1, 1),
+        '--doctor': (0, 0), '--health': (0, 0), '--backup': (0, 1), '--restore': (1, 1),
         '--uninstall': (0, 0), '--export-qr': (1, 2),
         '--disable-client': (1, 1), '--enable-client': (1, 1),
         '--set-expiry': (2, 2), '--enforce-expiry': (0, 0),
@@ -4104,6 +4317,8 @@ def admin_dispatch(arguments):
         fail('Unexpected option; see --help for command forms.')
     if operation == '--doctor':
         return ops_doctor(interface)
+    if operation == '--health':
+        return ops_health(interface)
     if operation == '--backup':
         return ops_backup(interface, values[0] if values else None)
     if operation == '--restore':
@@ -4198,8 +4413,8 @@ def main(arguments=None):
     if os.geteuid() != 0 or sys.platform != 'linux':
         fail('Run management commands as root on the Linux AmneziaWG server.')
     if len(arguments) != 2 or arguments[0] != '--manage':
-        admin_dispatch(arguments)
-        return 0
+        result = admin_dispatch(arguments)
+        return result if arguments[0] == '--health' else 0
     interface = valid_name(arguments[1])
     while True:
         print('\nAmneziaWG management: ' + interface + '\n'
@@ -4209,14 +4424,14 @@ def main(arguments=None):
               '9) Disable client\n10) Enable client\n11) Client expiry\n'
               '12) Redacted diagnostics\n13) Private backup\n14) Restore backup\n'
               '15) Export client QR (terminal or PNG)\n16) Uninstall this interface\n'
-              '17) Private DNS (dnsmasq)\n0) Exit')
+              '17) Private DNS (dnsmasq)\n18) AWG health check\n0) Exit')
         choice = prompt('Select: ')
         if choice == '0':
             return 0
         if choice == '6':
             network_assert_vpc_compatible(interface)
             return 42  # The shell holds the lock while running the existing VPC wizard.
-        simple = {'2': '--list-clients', '7': '--configure-network', '12': '--doctor'}
+        simple = {'2': '--list-clients', '7': '--configure-network', '12': '--doctor', '18': '--health'}
         accounts = {'3': '--export-client', '4': '--remove-client', '8': '--set-access',
                     '9': '--disable-client', '10': '--enable-client', '11': '--set-expiry',
                     '15': '--export-qr'}
@@ -4249,7 +4464,7 @@ def main(arguments=None):
         elif choice == '17':
             admin_dns_menu(interface)
         else:
-            print('Choose a menu number from 0 to 17.')
+            print('Choose a menu number from 0 to 18.')
 
 
 if __name__ == '__main__':
@@ -5428,12 +5643,39 @@ entry_install_command() {
     (( EUID == 0 )) || { say 'Run shortcut installation with sudo or as root.' >&2; return 1; }
     [[ $(uname -s) == Linux ]] || { say 'Install the shortcut on the Linux AWG server.' >&2; return 1; }
     command -v python3 >/dev/null || { say 'Python 3 is required to validate the shortcut.' >&2; return 1; }
-    python3 - "${BASH_SOURCE[0]}" <<'PY_ENTRY_COMMAND'
+    entry_command_python
+}
+
+entry_initialize() {
+    (( $# == 0 )) || { say 'Use --initialize without extra arguments.' >&2; return 1; }
+    (( EUID == 0 )) || { say 'Run initialization with sudo or as root.' >&2; return 1; }
+    [[ $(uname -s) == Linux ]] || { say 'Initialize on the Linux AWG server.' >&2; return 1; }
+    command -v python3 >/dev/null || { say 'Python 3 is required for initialization.' >&2; return 1; }
+    entry_command_python --initialize
+}
+
+entry_start() {
+    local status
+    # Only an interactive no-argument launch offers installation; CLI operations stay unchanged.
+    if (( EUID == 0 )) && [[ -t 0 && -t 1 && $(uname -s) == Linux ]] && command -v python3 >/dev/null; then
+        if entry_command_python --offer; then return 0; else status=$?; fi
+        (( status == 10 )) || return "$status"
+    fi
+    entry_menu
+}
+
+entry_command_python() {
+    python3 - "${BASH_SOURCE[0]}" "$@" <<'PY_ENTRY_COMMAND'
+from contextlib import contextmanager
+import fcntl
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
+import subprocess
 import sys
+import tempfile
 
 
 def command_fingerprint(info):
@@ -5514,7 +5756,7 @@ def command_install(source, destination=Path('/usr/local/bin/awg-manage'), confi
     if not executable:
         print('Owner execute permission will be added to the source script.')
     if not confirm():
-        print('Cancelled; no files changed.')
+        print('Cancelled; script installation and VPN configuration unchanged.')
         return
     source_now, current = command_source(source)
     if source_now != source or command_fingerprint(current) != command_fingerprint(original):
@@ -5565,14 +5807,283 @@ def command_install(source, destination=Path('/usr/local/bin/awg-manage'), confi
     print('The short name awg-manage works when /usr/local/bin is in the command search PATH.')
 
 
+def initialize_prompt(message):
+    with open('/dev/tty', 'r', encoding='utf-8') as reader, \
+            open('/dev/tty', 'w', encoding='utf-8') as writer:
+        writer.write(message)
+        writer.flush()
+        answer = reader.readline()
+    if not answer:
+        raise ValueError('Input closed; initialization cancelled.')
+    return answer.strip()
+
+
+def initialize_source(path):
+    path = Path(path).resolve(strict=True)
+    allowed = {0}
+    sudo_uid = os.environ.get('SUDO_UID', '')
+    if sudo_uid.isdecimal():
+        allowed.add(int(sudo_uid))
+    for parent in path.parents:
+        info = parent.lstat()
+        sticky = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in allowed
+                or info.st_mode & 0o022 and not sticky):
+            raise ValueError('The downloaded script has an untrusted parent directory; source retained.')
+    info = path.lstat()
+    if (not str(path).isprintable() or not stat.S_ISREG(info.st_mode) or info.st_uid not in allowed
+            or info.st_nlink != 1 or info.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID)):
+        raise ValueError('Use a regular script owned by root or the invoking sudo user, without shared write access or hard links.')
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+        if command_fingerprint(os.fstat(stream.fileno())) != command_fingerprint(info):
+            raise ValueError('The downloaded script changed while opening it; source retained.')
+        data = stream.read(4 * 1024 * 1024 + 1)
+        if command_fingerprint(os.fstat(stream.fileno())) != command_fingerprint(info):
+            raise ValueError('The downloaded script changed while reading it; source retained.')
+    if (len(data) > 4 * 1024 * 1024 or not data.startswith(b'#!/usr/bin/env bash\n') or b'\0' in data
+            or len(re.findall(rb'^EASY_AWG_VERSION=v[0-9]{4}-[0-9]{2}-[0-9]{2}-[1-9][0-9]*$', data, re.M)) != 1):
+        raise ValueError('The downloaded file is not a versioned standalone AWG script; source retained.')
+    return path, info, data
+
+
+def initialize_command_state(destination, source, target):
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        return None, None
+    command_parents(destination.parent)
+    if (stat.S_ISLNK(info.st_mode) and info.st_uid == 0
+            and destination.resolve(strict=True) in (source, target)):
+        return info, os.readlink(destination)
+    raise ValueError('An existing different command uses this path; retained: ' + str(destination))
+
+
+def initialize_ready(source, destination=Path('/usr/local/bin/awg-manage')):
+    try:
+        source, info = command_source(source)
+        shortcut, _ = initialize_command_state(destination, source, source)
+        return (source.name == 'setup-wireguard.sh' and stat.S_IMODE(info.st_mode) == 0o700
+                and stat.S_IMODE(source.parent.stat().st_mode) == 0o700 and shortcut is not None)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+@contextmanager
+def command_lock(directory=Path('/run/manage-amneziawg')):
+    # Share the install/update lock, but release it before entering the installed menu.
+    command_parents(directory.parent)
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    command_parents(directory)
+    if stat.S_IMODE(directory.lstat().st_mode) != 0o700:
+        raise ValueError('The runtime lock directory must have mode 700; existing permissions were retained.')
+    fd = os.open(directory / 'setup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise ValueError('The installation lock must be a root-owned mode-600 regular file without hard links.')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('Another setup process is running.') from None
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def initialize_sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def initialize_cleanup_allowed(source, info):
+    # User-writable download parents may be swapped after validation. Keep those originals.
+    if info.st_uid != 0:
+        return False
+    try:
+        command_parents(source.parent)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def initialize_install(source, directory, destination=Path('/usr/local/bin/awg-manage'), confirm=None):
+    source, original, data = initialize_source(source)
+    directory, destination = Path(directory), Path(destination)
+    target = directory / 'setup-wireguard.sh'
+    missing = command_parents(directory) + command_parents(destination.parent)
+    if directory.exists() and stat.S_IMODE(directory.stat().st_mode) != 0o700:
+        raise ValueError('Choose a dedicated installation directory with mode 700; existing directory permissions were retained.')
+    previous = None
+    if os.path.lexists(target):
+        current, previous = command_source(target)
+        if current != target or stat.S_IMODE(previous.st_mode) != 0o700 or target.read_bytes() != data:
+            raise ValueError('A different script already occupies the installation path; use its updater or choose another directory.')
+    old_link, old_text = initialize_command_state(destination, source, target)
+    found = shutil.which(destination.name)
+    if found and Path(found).absolute() != destination and Path(found).resolve() not in (source, target):
+        raise ValueError('Another command with this name is on PATH; it was retained.')
+    if source == target and old_link is not None:
+        print('Initialization already complete: ' + str(target))
+        return target
+    print('Install directory: ' + str(directory))
+    print('Installed script:  ' + str(target))
+    print('Command shortcut:  ' + str(destination))
+    remove_original = initialize_cleanup_allowed(source, original)
+    if source != target:
+        note = ('removed only after installation and verification succeed' if remove_original
+                else 'retained: download location is not protected by root-owned directories')
+        print('Original script:   ' + str(source) + ' (' + note + ')')
+    print('Only script installation paths change. Existing AWG services, configuration, accounts and keys stay unchanged.')
+    confirm = confirm or (lambda: initialize_prompt('Type APPLY to initialize the script installation: ') == 'APPLY')
+    if not confirm():
+        print('Cancelled; script installation and VPN configuration unchanged.')
+        return None
+    latest, current, current_data = initialize_source(source)
+    if latest != source or command_fingerprint(current) != command_fingerprint(original) or current_data != data:
+        raise ValueError('The source changed during confirmation; no installation was performed.')
+    command_parents(directory)
+    command_parents(destination.parent)
+    now, now_text = initialize_command_state(destination, source, target)
+    if ((old_link is None) != (now is None) or now_text != old_text
+            or old_link is not None and command_fingerprint(now) != command_fingerprint(old_link)):
+        raise ValueError('The command path changed during confirmation; current entry retained.')
+    created, installed, linked, temporary, temporary_link = [], None, None, None, None
+    try:
+        for path in dict.fromkeys(missing):
+            try:
+                path.mkdir(mode=0o700 if path == directory else 0o755)
+                created.append((path, path.lstat()))
+            except FileExistsError:
+                pass
+            command_parents(path)
+        if stat.S_IMODE(directory.stat().st_mode) != 0o700:
+            raise ValueError('The installation directory changed; its permissions were retained.')
+        if previous is None:
+            fd, temporary = tempfile.mkstemp(prefix='.easy-awg-install-', dir=directory)
+            with os.fdopen(fd, 'wb') as stream:
+                os.fchmod(stream.fileno(), 0o700)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if subprocess.run(['bash', '-n', temporary], capture_output=True, timeout=15).returncode:
+                raise ValueError('The staged script failed Bash syntax validation; original retained.')
+            # Hard-link publication is exclusive, unlike replacement of an existing destination.
+            os.link(temporary, target, follow_symlinks=False)
+            installed = target.lstat()
+            os.unlink(temporary)
+            temporary = None
+            installed = target.lstat()
+        else:
+            if command_fingerprint(target.lstat()) != command_fingerprint(previous):
+                raise ValueError('The installed script changed during confirmation; retained.')
+        if target.read_bytes() != data:
+            raise ValueError('Installed script verification failed; original retained.')
+        if old_link is None:
+            os.symlink(str(target), destination)
+        elif destination.resolve(strict=True) != target:
+            if command_fingerprint(destination.lstat()) != command_fingerprint(old_link):
+                raise ValueError('The command changed before relocation; retained.')
+            fd, temporary_link = tempfile.mkstemp(prefix='.easy-awg-link-', dir=destination.parent)
+            os.close(fd)
+            os.unlink(temporary_link)
+            os.symlink(str(target), temporary_link)
+            now, now_text = initialize_command_state(destination, source, target)
+            if (now is None or command_fingerprint(now) != command_fingerprint(old_link) or now_text != old_text):
+                raise ValueError('The command changed before relocation; retained.')
+            os.replace(temporary_link, destination)
+            temporary_link = None
+        linked = destination.lstat()
+        if not destination.is_symlink() or destination.resolve(strict=True) != target:
+            raise ValueError('The installed command failed verification; original retained.')
+        # Persist new files and directory entries before removing a protected original.
+        for path in dict.fromkeys([directory, destination.parent, *(p.parent for p, _ in reversed(created))]):
+            initialize_sync_directory(path)
+        latest, current, current_data = initialize_source(source)
+        if latest != source or command_fingerprint(current) != command_fingerprint(original) or current_data != data:
+            raise ValueError('The source changed before cleanup; current source retained.')
+        if source != target and remove_original and initialize_cleanup_allowed(source, current):
+            os.unlink(source)
+    except BaseException:
+        if linked is not None and os.path.lexists(destination) and command_fingerprint(destination.lstat()) == command_fingerprint(linked):
+            if old_text is None:
+                destination.unlink()
+            elif os.readlink(destination) != old_text:
+                destination.unlink()
+                destination.symlink_to(old_text)
+        if installed is not None and os.path.lexists(target) and command_fingerprint(target.lstat()) == command_fingerprint(installed):
+            target.unlink()
+        # Remove staged files before removing their newly created parent directories.
+        for path in (temporary, temporary_link):
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        for path, info in reversed(created):
+            try:
+                if command_fingerprint(path.lstat())[:2] == command_fingerprint(info)[:2]:
+                    path.rmdir()
+            except OSError:
+                pass
+        raise
+    finally:
+        for path in (temporary, temporary_link):
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+    print('Initialization complete. Run: sudo ' + str(destination))
+    return target
+
+
+def initialize_main(source, offer=False):
+    if offer:
+        if initialize_ready(source):
+            return 10
+        print('Initialize a stable script location and the awg-manage command before using the menu?')
+        while True:
+            answer = initialize_prompt('1) Initialize script  2) Skip for now  0) Exit: ')
+            if answer in ('0', '1', '2'):
+                break
+            print('Choose 1, 2, or 0.')
+        if answer == '0':
+            return 0
+        if answer == '2':
+            return 10
+    directory = initialize_prompt('Installation directory [/usr/local/lib/easy-awg]: ') or '/usr/local/lib/easy-awg'
+    with command_lock():
+        target = initialize_install(source, directory)
+    if target is not None and offer:
+        os.execv('/bin/bash', ['bash', '--', str(target)])
+    return 10 if offer else 0
+
+
 if __name__ == '__main__':
     try:
-        if os.geteuid() != 0 or sys.platform != 'linux' or len(sys.argv) != 2:
-            raise ValueError('Run shortcut installation as root on the Linux AWG server.')
-        command_install(sys.argv[1])
-    except (OSError, ValueError) as error:
+        if os.geteuid() != 0 or sys.platform != 'linux' or len(sys.argv) not in (2, 3):
+            raise ValueError('Run script installation as root on the Linux AWG server.')
+        if len(sys.argv) == 2:
+            with command_lock():
+                command_install(sys.argv[1])
+        elif sys.argv[2] in ('--initialize', '--offer'):
+            sys.exit(initialize_main(sys.argv[1], offer=sys.argv[2] == '--offer'))
+        else:
+            raise ValueError('Unexpected script installation option.')
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         print('ERROR: ' + str(error), file=sys.stderr)
         sys.exit(1)
+
 PY_ENTRY_COMMAND
 }
 
@@ -5673,7 +6184,7 @@ entry_menu() {
         say 'AmneziaWG main menu'
         say '1) Install a new instance'
         say '2) Manage an existing instance'
-        say '3) Install command shortcut (awg-manage)'
+        say '3) Initialize / install command (awg-manage)'
         say '4) Check / update script'
         say '0) Exit'
         entry_prompt choice 'Select: ' || return 0
@@ -5692,9 +6203,12 @@ entry_menu() {
                 fi
                 ;;
             3)
-                if entry_run --install-command; then :; else
+                if entry_run --initialize; then
+                    # Initialization may relocate this script; the old menu must stop.
+                    return 0
+                else
                     status=$?
-                    say "Shortcut installation exited with status $status. Existing commands were retained." >&2
+                    say "Script initialization exited with status $status. Review the messages above before retrying." >&2
                 fi
                 ;;
             4)
@@ -5713,7 +6227,7 @@ entry_menu() {
 
 main() {
     if (( $# == 0 )); then
-        entry_menu
+        entry_start
         return
     fi
     case ${1:-} in
@@ -5729,6 +6243,11 @@ main() {
             return
             ;;
     esac
+    if [[ ${1:-} == --initialize ]]; then
+        shift
+        entry_initialize "$@"
+        return
+    fi
     if [[ ${1:-} == --install-command ]]; then
         shift
         entry_install_command "$@"
@@ -5737,11 +6256,13 @@ main() {
     if [[ ${1:-} == --help ]]; then
         say 'Usage: sudo bash setup-manage-amneziawg.sh  (interactive main menu)'
         say '       sudo bash setup-manage-amneziawg.sh --install'
+        say '       sudo bash setup-manage-amneziawg.sh --initialize'
         say '       sudo bash setup-manage-amneziawg.sh --install-command'
         say '       sudo bash setup-manage-amneziawg.sh --version'
         say '       sudo bash setup-manage-amneziawg.sh --check-update'
         say '       sudo bash setup-manage-amneziawg.sh --update'
-        say 'No arguments opens the main menu: install, manage an existing instance, install a command shortcut, or update the script.'
+        say 'No arguments offers first-run script initialization, then opens the main menu: install, manage, initialize, or update.'
+        say 'Initialization asks for a private installation directory and creates awg-manage. A protected root-owned source is removed after verified installation; other source paths are retained. Existing VPN data stays unchanged.'
         say 'Updates use Accec/easy-awg stable Release assets and SHA256SUMS, require APPLY, back up the old script, and never downgrade.'
         say 'Only this script is replaced; AWG packages, running services, saved accounts, and network policies remain unchanged. Re-run after updating.'
         say 'Shortcut installation links /usr/local/bin/awg-manage to this script after APPLY; existing different commands remain untouched.'
@@ -5755,6 +6276,7 @@ main() {
         say '       sudo bash setup-manage-amneziawg.sh --set-port INTERFACE PORT'
         say '       sudo bash setup-manage-amneziawg.sh --configure-vpc [INTERFACE] [--preview]'
         say '       sudo bash setup-manage-amneziawg.sh --doctor INTERFACE'
+        say '       sudo bash setup-manage-amneziawg.sh --health INTERFACE'
         say '       sudo bash setup-manage-amneziawg.sh --disable-client INTERFACE NAME'
         say '       sudo bash setup-manage-amneziawg.sh --enable-client INTERFACE NAME'
         say '       sudo bash setup-manage-amneziawg.sh --set-expiry INTERFACE NAME UTC_TIMESTAMP_OR_none'
@@ -5808,13 +6330,15 @@ main() {
             configure_vpc "$@"
             return
             ;;
-        --manage|--add-client|--list-clients|--export-client|--remove-client|--set-port|--doctor|--backup|--restore|--uninstall|--export-qr|--disable-client|--enable-client|--set-expiry|--enforce-expiry|--configure-network|--set-access|--assert-vpc-compatible|--check-server|--check-empty-server|--show-dns|--configure-dns|--disable-dns)
+        --manage|--add-client|--list-clients|--export-client|--remove-client|--set-port|--doctor|--health|--backup|--restore|--uninstall|--export-qr|--disable-client|--enable-client|--set-expiry|--enforce-expiry|--configure-network|--set-access|--assert-vpc-compatible|--check-server|--check-empty-server|--show-dns|--configure-dns|--disable-dns)
             (( $# >= 2 )) || die 'Supply the AmneziaWG interface; use --help for command forms.'
             [[ $2 =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]] || die 'Invalid AmneziaWG interface name.'
             (( EUID == 0 )) || die 'Run with sudo or as root.'
             [[ $(uname -s) == Linux ]] || die 'Run on the Linux AmneziaWG server.'
             local manager_command
-            for manager_command in awg ip python3 flock; do
+            local manager_commands=(awg ip python3 flock)
+            if [[ $1 == --health ]]; then manager_commands=(python3 flock); fi
+            for manager_command in "${manager_commands[@]}"; do
                 command -v "$manager_command" >/dev/null || die "Required command missing: $manager_command"
             done
             if [[ $1 == --set-port || $1 == --manage ]]; then
@@ -5822,7 +6346,7 @@ main() {
                     command -v "$manager_command" >/dev/null || die "Required command missing: $manager_command"
                 done
             fi
-            if [[ $1 != --doctor ]]; then check_awg_version; fi
+            if [[ $1 != --doctor && $1 != --health ]]; then check_awg_version; fi
             # Scheduled enforcement takes this same lock inside Python.
             if [[ $1 != --enforce-expiry ]]; then acquire_lock; fi
             local manager_status
