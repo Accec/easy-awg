@@ -205,7 +205,7 @@ This release fixes the DNS settings reader treating `/etc/systemd/system` as a p
 - A restore changing the tunnel subnet while a legacy VPC policy is active stops before mutation; plan that migration separately.
 - Removing this script's forwarding configuration does not force the shared runtime IPv4-forwarding setting off, because another service may need it.
 
-The release artifact passed 703 offline development tests, including real pseudo-terminal confirmation regressions and a Gitleaks scan with no findings. The development tests are not included in this minimal distribution. Real Linux firewall behavior, systemd reboot ordering, actual dnsmasq resolution, QR decoding and client connectivity still require deployment acceptance testing.
+The `v2026-11-08-7` artifact passed 703 offline development tests, including real pseudo-terminal confirmation regressions. This release's single-ENI change passed 13 focused tests extracted from the embedded VPC wizard, plus Bash syntax, ShellCheck, embedded Python compilation and a Gitleaks scan with no findings. The full development suite is not included in this minimal distribution. Real Linux firewall behavior, AWS forwarding, systemd reboot ordering, actual dnsmasq resolution, QR decoding and client connectivity still require deployment acceptance testing.
 
 ## Download statistics
 
