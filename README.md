@@ -47,7 +47,7 @@ The previous `--install-command` link-only command remains available. It require
 - Guided server-only native AmneziaWG installation with six prompts and custom UDP ports; add named accounts afterward.
 - Per-device client profiles, names such as `alice.mac`, suspension/resumption and UTC account expiry.
 - Numbered account selection for existing-client operations, with VPN addresses and configured state.
-- Numbered VPC interface, target-scope and SNAT choices, plus split/full-tunnel IPv4 routing.
+- Numbered VPC interface, target-scope and SNAT choices, including a direct-host `/32` fallback for single-ENI gateways, plus split/full-tunnel IPv4 routing.
 - Gateway-enforced per-client destination and port permissions.
 - Optional per-instance dnsmasq with private domain records, upstream forwarding, and client DNS inheritance/restoration.
 - Terminal configuration/QR output or private file export, redacted diagnostics, backups, restore and scoped removal.
@@ -58,6 +58,7 @@ Direct command examples:
 ```bash
 sudo bash ./setup-wireguard.sh --help
 sudo bash ./setup-wireguard.sh --manage awg-manage
+sudo bash ./setup-wireguard.sh --configure-vpc awg-manage --preview
 sudo bash ./setup-wireguard.sh --configure-network awg-manage full --preview
 sudo bash ./setup-wireguard.sh --doctor awg-manage
 sudo bash ./setup-wireguard.sh --health awg-manage
@@ -99,6 +100,39 @@ sudo bash ./setup-wireguard.sh --export-client awg-manage alice.mac
 sudo bash ./setup-wireguard.sh --export-qr awg-manage alice.mac
 ```
 Client names start with an ASCII letter and accept up to 15 letters, digits, dots, underscores or hyphens. Interface naming rules are unchanged. Configuration text and QR codes contain credentials: terminal scrollback, output redirection and session recordings can retain them. Display them only in a trusted session. QR generation stays local and requires `qrencode`.
+
+## VPC access
+
+Choose management option **6: Configure VPC access**, or preview and apply it directly:
+
+```bash
+sudo bash ./setup-wireguard.sh --configure-vpc awg-manage --preview
+sudo bash ./setup-wireguard.sh --configure-vpc awg-manage
+```
+
+The wizard lists dedicated, non-default RFC1918 interfaces first. It also offers
+an RFC1918 interface that carries the default route as a single-ENI fallback.
+That fallback accepts only one `/32` target inside the interface's directly
+connected subnet. It verifies that the host route uses the selected interface
+without a gateway and leaves the default route unchanged. Dedicated private
+interfaces retain their existing CIDR target support.
+
+Applying the policy enables IPv4 forwarding, adds the scoped UFW forwarding and
+SNAT rules, and updates stored client `AllowedIPs`. The SNAT address is the exact
+private address selected on the gateway interface, so the target sees that
+address rather than the client tunnel address. Preview mode performs the same
+validation without changing files, UFW, sysctl, or the running interface.
+
+On AWS, disable the source/destination check for the gateway instance or ENI that
+forwards this traffic. Allow the selected SNAT private address as a `/32` and the
+application port in the target security group, network ACLs, and service controls
+such as Nginx. After applying or changing a VPC policy, re-export and re-import
+client profiles so their `AllowedIPs` include the target `/32` or CIDR.
+
+Private DNS records and VPC routes are separate. A record may resolve a private
+hostname to the target, but it does not add the target to client routes or create
+forwarding and SNAT policy.
+
 ## Private DNS
 
 Choose management option **17: Private DNS (dnsmasq)**, then show settings,

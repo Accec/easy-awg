@@ -4,7 +4,7 @@ set +x
 set -Eeuo pipefail
 umask 077
 
-EASY_AWG_VERSION=v2026-11-08-7
+EASY_AWG_VERSION=v2026-11-18-1
 
 # Edit these defaults or supply environment variables when invoking the script.
 # The wizard shows each default and lets you replace it before installation.
@@ -4750,8 +4750,29 @@ def choose_number(label, options, default=''):
         print('Choose a displayed number or value.')
 
 
-def vpc_interfaces(awg_interfaces, vpn_address):
-    defaults = {route.get('dev') for route in json.loads(run('ip', '-j', '-4', 'route', 'show', 'default'))}
+def default_route_interfaces():
+    routes = json.loads(run('ip', '-j', '-4', 'route', 'show', 'default'))
+    if not isinstance(routes, list) or any(not isinstance(route, dict) for route in routes):
+        fail('Unexpected default-route inventory.')
+    result = set()
+    for route in routes:
+        if 'dev' in route:
+            if not isinstance(route['dev'], str):
+                fail('Unexpected default-route interface.')
+            result.add(route['dev'])
+        nexthops = route.get('nexthops', [])
+        if not isinstance(nexthops, list) or any(not isinstance(hop, dict) for hop in nexthops):
+            fail('Unexpected default-route next-hop inventory.')
+        for hop in nexthops:
+            if 'dev' in hop:
+                if not isinstance(hop['dev'], str):
+                    fail('Unexpected default-route next-hop interface.')
+                result.add(hop['dev'])
+    return result
+
+
+def vpc_interfaces(awg_interfaces, vpn_address, defaults=None):
+    defaults = default_route_interfaces() if defaults is None else defaults
     entries = json.loads(run('ip', '-j', '-4', 'address', 'show'))
     result = {}
     for entry in entries:
@@ -4760,7 +4781,7 @@ def vpc_interfaces(awg_interfaces, vpn_address):
         name = entry.get('ifname', '')
         if not isinstance(name, str):
             continue
-        if name in defaults or name in awg_interfaces or name == 'lo' or 'UP' not in (entry.get('flags') or []):
+        if name in awg_interfaces or name == 'lo' or 'UP' not in (entry.get('flags') or []):
             continue
         try:
             valid_interface(name)
@@ -4779,15 +4800,19 @@ def vpc_interfaces(awg_interfaces, vpn_address):
                      and not address.network.overlaps(vpn_address.network)]
         if addresses:
             result[name] = addresses
-    return result
+    dedicated = {name: addresses for name, addresses in result.items() if name not in defaults}
+    fallback = {name: addresses for name, addresses in result.items() if name in defaults}
+    return {**dedicated, **fallback}
 
 
-def choose_vpc_target(assigned, saved=None):
+def choose_vpc_target(assigned, saved=None, single_eni=False):
     networks = list(dict.fromkeys(str(address.network) for address in assigned))
     local_ips = {address.ip for address in assigned}
     def validate(value):
         target = target_network(value)
         network = ipaddress.IPv4Network(target)
+        if single_eni and network.prefixlen != 32:
+            fail('A default-route VPC interface supports only one directly connected private host (/32).')
         if not any(network.subnet_of(address.network) for address in assigned):
             fail('The complete target must be on the selected private interface subnet.')
         if network.prefixlen == 32 and network.network_address in local_ips:
@@ -4799,9 +4824,12 @@ def choose_vpc_target(assigned, saved=None):
         saved = None
     options = ([(saved, 'Keep saved target: ' + saved)] if saved else [])
     options += [('custom', 'Enter a remote server IPv4 or custom CIDR (single host uses /32)')]
-    options += [(network, 'Entire connected subnet: ' + network + ' (all addresses, not one server)') for network in networks]
+    if not single_eni:
+        options += [(network, 'Entire connected subnet: ' + network + ' (all addresses, not one server)') for network in networks]
     print('Target means the remote server or network to access, not this gateway address.')
     print('Remote server addresses are not discovered from local interfaces; use the target server VPC address.')
+    if single_eni:
+        print('This interface also carries the default route; only a directly connected RFC1918 host /32 is accepted.')
     for index, (_, description) in enumerate(options, 1):
         print(str(index) + ') ' + description)
     while True:
@@ -4817,15 +4845,17 @@ def choose_vpc_target(assigned, saved=None):
 
 
 def choose_vpc_policy(awg_interfaces, vpn_address, old):
-    candidates = vpc_interfaces(awg_interfaces, vpn_address)
+    defaults = default_route_interfaces()
+    candidates = vpc_interfaces(awg_interfaces, vpn_address, defaults)
     print('Private exit interfaces below belong to this AWG gateway, not the remote target server.')
     options = [(name, name + ' | gateway ' + ', '.join(str(address.ip) for address in addresses)
-                + ' | connected subnet ' + ', '.join(dict.fromkeys(str(address.network) for address in addresses)))
+                + ' | connected subnet ' + ', '.join(dict.fromkeys(str(address.network) for address in addresses))
+                + (' | default-route single-ENI fallback; /32 only' if name in defaults else ''))
                for name, addresses in candidates.items()]
     default = old['out'] if old and old['out'] in candidates else next(iter(candidates)) if len(candidates) == 1 else ''
     outbound = choose_number('2/4 VPC exit interface', options, default)
     assigned = candidates[outbound]
-    target = choose_vpc_target(assigned, old['target'] if old else None)
+    target = choose_vpc_target(assigned, old['target'] if old else None, outbound in defaults)
     matching = [address for address in assigned if ipaddress.IPv4Network(target).subnet_of(address.network)]
     sources = list(dict.fromkeys(str(address.ip) for address in matching))
     default = old['snat'] if old and old['snat'] in sources else sources[0] if len(sources) == 1 else ''
@@ -4858,9 +4888,8 @@ def validate_route(policy, vpn_address):
         fail('The SNAT address and complete target must be on the selected private VPC interface subnet.')
     if target.overlaps(vpn_address.network) or policy['out'] == policy['interface']:
         fail('VPC and AWG networks and interfaces must be distinct.')
-    defaults = json.loads(run('ip', '-j', '-4', 'route', 'show', 'default'))
-    if policy['out'] in {r.get('dev') for r in defaults}:
-        fail('Select the private VPC interface, not a default-route interface.')
+    if policy['out'] in default_route_interfaces() and target.prefixlen != 32:
+        fail('A default-route VPC interface supports only one directly connected private host (/32).')
     if target.prefixlen == 32 and target.network_address == ipaddress.IPv4Address(policy['snat']):
         fail('Choose a remote VPC target, not this gateway SNAT address.')
     first = target.network_address + (1 if target.prefixlen < 31 else 0)
@@ -5161,9 +5190,11 @@ def main(argv=None):
             fail('An existing forwarding rule has the same scope; review it before adopting this policy.')
     run('iptables-restore', '--test', data=proposed[BEFORE])
     print('\nVPC access: ' + source + ' -> ' + target + ' via ' + outbound + '; SNAT ' + snat)
+    if outbound in default_route_interfaces():
+        print('Single-ENI fallback: the target is one directly connected private host (/32); the default route remains unchanged.')
     print('Stored client profiles: ' + str(len(clients)) + '; changed files: ' + str(len(changes)))
     print('Server keys, peers, port and AWG service remain unchanged. SSH, default route and unrelated UFW rules stay in place.')
-    print('Existing imported clients need the updated AllowedIPs or a fresh profile import; Test sees the VPC SNAT address.')
+    print('Existing imported clients need the updated AllowedIPs or a fresh profile import; the target sees the VPC SNAT address.')
     if args.preview:
         print('Preview only; no files or network settings changed.')
         return
@@ -6296,7 +6327,7 @@ main() {
         say 'PSK update preserves existing keys and networking, backs up profiles, and updates only the selected peer.'
         say 'Check mode reads profiles and live state without printing secrets or changing configuration.'
         say 'New installation creates only the server, with no default client. Add named clients in management; split/full routing remains configurable.'
-        say 'VPC wizard: choose the existing AWG interface, private VPC exit, target, and SNAT address; review before APPLY.'
+        say 'VPC wizard: choose the existing AWG interface, a dedicated private exit or single-ENI direct host, target, and SNAT address; review before APPLY.'
         say 'VPC changes update stored client routes. Re-export/re-import distributed profiles; cloud firewalls remain unchanged.'
         say 'Full mode provides IPv4 Internet egress, explicit DNS, and tunneled IPv6 blocking; it is not dual-stack Internet or a client kill switch.'
         say 'Private DNS is optional per instance: named IPv4 records plus upstream forwarding. Connected clients send system DNS queries through the tunnel, not only private names.'
